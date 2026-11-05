@@ -1,0 +1,9 @@
+name: outrun
+description: Puts outrun's CLI on the job's PATH, at the version this action is pinned to; the job then runs `outrun lookup`, `outrun record` or `outrun test` itself.
+author: Arkadia
+runs:
+  using: composite
+  steps:
+    - name: Install outrun
+      shell: sh
+      run: '"$GITHUB_ACTION_PATH/action/install.sh"'

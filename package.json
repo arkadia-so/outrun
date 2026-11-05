@@ -1,0 +1,46 @@
+{
+  "name": "@arkadia-so/outrun",
+  "version": "1.0.0",
+  "private": true,
+  "description": "outrun's CI engine: each test file a unit, keyed by its content, its verdict cached, the misses batched and balanced across runners.",
+  "homepage": "https://outrun.sh",
+  "bugs": {
+    "email": "contact@arkadia.so"
+  },
+  "author": {
+    "name": "Arkadia",
+    "email": "contact@arkadia.so",
+    "url": "https://arkadia.so"
+  },
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "packageManager": "bun@1.4.4-canary.20261027.1",
+  "bin": {
+    "outrun": "src/main.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "bun check --no-script",
+    "knip": "knip --no-progress",
+    "build": "bun build --compile --minify src/main.ts --outfile dist/outrun",
+    "bundle": "bun build --target=bun --minify src/main.ts --outfile dist/outrun.js"
+  },
+  "dependencies": {
+    "@effect/platform-bun": "4.0.7",
+    "effect": "4.0.7",
+    "hono": "4.13.14"
+  },
+  "devDependencies": {
+    "@effect/vitest": "4.0.7",
+    "@types/bun": "1.4.4",
+    "knip": "6.44.0",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  },
+  "overrides": {
+    "effect": "4.0.7",
+    "hono": "4.13.14",
+    "@effect/platform-bun": "4.0.7",
+    "@effect/platform-node-shared": "4.0.7"
+  }
+}
