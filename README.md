@@ -22,7 +22,7 @@ permissions:
   contents: read
   id-token: write # the cache authenticates the job by its OIDC token
 env:
-  OUTRUN_CACHE_URL: https://turbo-cache.arkadia.so
+  OUTRUN_CACHE_URL: https://cache.outrun.sh
 jobs:
   build:
     steps:
