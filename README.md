@@ -74,6 +74,10 @@ On this machine (`$OUTRUN_STATE_DIR`, by default `~/.cache/outrun`), and on any 
 cache (v8 API): `OUTRUN_CACHE_URL`, `OUTRUN_CACHE_TEAM`, and `OUTRUN_CACHE_TOKEN` or, in a GitHub
 Actions job with `id-token: write`, the job's OIDC token.
 
+The client is gentle with the network: at most 8 requests to the cache at once, over keep-alive
+connections, to one address of the cache's host (resolved once, the next one tried after a
+failure), so a burst of lookups or of Nx's requests never becomes a burst of new connections.
+
 ## Running
 
 - Batches are admitted by memory (each suite declares `memoryMb`), killed with their whole process

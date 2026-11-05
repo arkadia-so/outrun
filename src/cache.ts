@@ -18,23 +18,18 @@
 import { mkdir } from "node:fs/promises";
 import { Effect } from "effect";
 import { CacheUnavailable, FileFailed } from "./errors.ts";
+import { type Remote, request, UPSTREAM_CONCURRENCY } from "./upstream.ts";
 
 export interface CacheEntry {
   readonly durationMs: number;
   readonly tag: string;
 }
 
-export interface Remote {
-  readonly url: string;
-  readonly team: string;
-  readonly token: string;
-}
-
 // Measured from a fleet runner (ARK-81, 2026-11-03): the server answers a 100-hash query in 3.6 s
 // (it heads each hash in storage, a few at a time) and a GET or PUT in 0.3-0.8 s, while 16
-// parallel requests take as long as one. So the client asks small and wide.
+// parallel requests take as long as one. So the client asks small, as wide as the client to the
+// cache allows (upstream.ts: wider bursts of new connections lose SYNs on the fleet).
 const QUERY_SIZE = 10;
-const CONCURRENCY = 64;
 
 const sha256 = (text: string) => new Bun.CryptoHasher("sha256").update(text).digest("hex");
 /** The artifact holding a unit's last measured duration. */
@@ -47,21 +42,6 @@ export const divergenceKey = (suite: string, toolchain: string) => sha256(`outru
 /** The artifact holding a suite's traced read sets (keys.ts). */
 export const readSetsKey = (suite: string, toolchain: string) => sha256(`outrun-readsets-1\n${toolchain}\n${suite}`);
 
-/** One call to the cache, with its own timeout: every client of the cache goes through it. */
-export const request = (remote: Remote, path: string, init: RequestInit, timeoutMs = 20_000) =>
-  Effect.tryPromise({
-    try: async (signal) => {
-      const url = `${remote.url}${path}${path.includes("?") ? "&" : "?"}slug=${encodeURIComponent(remote.team)}`;
-      const response = await fetch(url, {
-        ...init,
-        signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
-        headers: { authorization: `Bearer ${remote.token}`, ...init.headers },
-      });
-      return response;
-    },
-    catch: (error) => new CacheUnavailable({ message: `${init.method ?? "GET"} ${path}: ${error instanceof Error ? error.message : String(error)}` }),
-  });
-
 /** The entries of these artifacts (null when absent), from the batch query. */
 export const query = (remote: Remote, hashes: readonly string[]) =>
   Effect.gen(function* () {
@@ -73,8 +53,8 @@ export const query = (remote: Remote, hashes: readonly string[]) =>
         request(remote, "/v8/artifacts", { method: "POST", body: JSON.stringify({ hashes: chunk }), headers: { "content-type": "application/json" } }).pipe(
           Effect.flatMap((response) =>
             response.ok
-              ? Effect.tryPromise({
-                  try: () => response.json() as Promise<Record<string, { taskDurationMs?: number; tag?: string } | null>>,
+              ? Effect.try({
+                  try: () => JSON.parse(new TextDecoder().decode(response.body)) as Record<string, { taskDurationMs?: number; tag?: string } | null>,
                   catch: () => new CacheUnavailable({ message: "the batch query's answer is not JSON" }),
                 })
               : Effect.fail(new CacheUnavailable({ message: `the batch query answered ${response.status}` })),
@@ -84,7 +64,7 @@ export const query = (remote: Remote, hashes: readonly string[]) =>
           Effect.retry({ times: 2 }),
           Effect.result,
         ),
-      { concurrency: CONCURRENCY },
+      { concurrency: UPSTREAM_CONCURRENCY },
     ).pipe(
       Effect.flatMap((results) => {
         const ok = results.flatMap((r) => (r._tag === "Success" ? [r.success] : []));
@@ -112,7 +92,7 @@ export const get = (remote: Remote, hash: string, timeoutMs?: number) =>
       response.status === 404
         ? Effect.succeed(undefined)
         : response.ok
-          ? Effect.tryPromise({ try: () => response.text(), catch: () => new CacheUnavailable({ message: `GET ${hash}: the body did not arrive` }) })
+          ? Effect.succeed(new TextDecoder().decode(response.body))
           : Effect.fail(new CacheUnavailable({ message: `GET ${hash} answered ${response.status}` })),
     ),
   );
@@ -135,7 +115,7 @@ export const put = (remote: Remote, puts: readonly Put[]) =>
         Effect.retry({ times: 2 }),
         Effect.map((response) => (response.ok ? 0 : 1)),
       ),
-    { concurrency: CONCURRENCY },
+    { concurrency: UPSTREAM_CONCURRENCY },
   ).pipe(Effect.map((refused) => refused.reduce<number>((a, b) => a + b, 0)));
 
 /** A GitHub Actions job's OIDC token for the cache's audience (needs `permissions: id-token: write`). */

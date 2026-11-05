@@ -26,9 +26,10 @@ import { Console, Effect, Exit, Option, Runtime } from "effect";
 import { Argument, CliError, Command, Flag } from "effect/cli";
 import pkg from "../package.json" with { type: "json" };
 import { BAZEL, buildCacheApp, NX } from "./build-cache.ts";
-import { githubOidc, type Remote } from "./cache.ts";
+import { githubOidc } from "./cache.ts";
 import { blocking, keyUnits, lookupCommand, plan, recordCommand, test } from "./engine.ts";
 import { CacheUnavailable, TestsFailed, UsageInvalid } from "./errors.ts";
+import type { Remote } from "./upstream.ts";
 import { xcodeReads } from "./xcode-reads.ts";
 
 const env = process.env as Readonly<Record<string, string | undefined>>;

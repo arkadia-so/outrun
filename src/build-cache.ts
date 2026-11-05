@@ -10,8 +10,8 @@
 //     /cas/{sha256}), --remote_cache=http://127.0.0.1:<port>; artifacts `bzac<hash>`, `bzcas<hash>`.
 import { Console, Effect } from "effect";
 import { Hono } from "hono";
-import { request } from "./cache.ts";
 import { CacheUnavailable } from "./errors.ts";
+import { request } from "./upstream.ts";
 
 export interface BuildCacheOptions {
   readonly url: string;
@@ -85,10 +85,7 @@ export const buildCacheApp = (protocol: Protocol, options: BuildCacheOptions) =>
             response.status === 404
               ? Effect.succeed(new Response("The record was not found", { status: 404 }))
               : response.ok
-                ? Effect.tryPromise({
-                    try: () => response.arrayBuffer(),
-                    catch: () => new CacheUnavailable({ message: `GET ${hash}: the body did not arrive` }),
-                  }).pipe(Effect.map((archive) => new Response(archive, { status: 200, headers: { "content-type": "application/octet-stream" } })))
+                ? Effect.succeed(new Response(response.body.slice().buffer, { status: 200, headers: { "content-type": "application/octet-stream" } }))
                 : Effect.fail(new CacheUnavailable({ message: `GET ${hash} answered ${response.status}` })),
           ),
           // A connection reset now and then (seen on TanStack/query, ARK-81): asked again, the

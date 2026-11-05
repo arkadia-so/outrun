@@ -12,7 +12,7 @@ import { pytestAdapter } from "./adapters/pytest.ts";
 import { vitestAdapter } from "./adapters/vitest.ts";
 import { xcodeAdapter } from "./adapters/xcode.ts";
 import { batches, fillIdle, runnersFor, shard } from "./balance.ts";
-import { type CacheEntry, divergenceKey, LocalCache, type Put, put, quarantineKey, query, type Remote, timingKey } from "./cache.ts";
+import { type CacheEntry, divergenceKey, LocalCache, type Put, put, quarantineKey, query, timingKey } from "./cache.ts";
 import { type Config, loadConfig, type Suite } from "./config.ts";
 import { FileFailed, UsageInvalid } from "./errors.ts";
 import { exec } from "./exec.ts";
@@ -23,6 +23,7 @@ import { loadReadSets, saveReadSets } from "./readsets.ts";
 import { ImportGraph, scanSource } from "./sources/imports.ts";
 import { parseObserved, readSetOf } from "./sources/observed.ts";
 import { loadScans, saveScans, stateDir } from "./state.ts";
+import type { Remote } from "./upstream.ts";
 import { formatTag, parseTag, type Tier, tierOf, usable, type Verdict } from "./verdict.ts";
 
 const ADAPTERS: Record<Suite["adapter"], Adapter> = {

@@ -3,9 +3,10 @@
 // merging at once) only costs a later run the narrower key: it still has the closure's.
 import { mkdir, rename } from "node:fs/promises";
 import { Console, Effect } from "effect";
-import { get, put, readSetsKey, type Remote } from "./cache.ts";
+import { get, put, readSetsKey } from "./cache.ts";
 import { FileFailed } from "./errors.ts";
 import type { ReadSet } from "./keys.ts";
+import type { Remote } from "./upstream.ts";
 
 /** How many read sets a weak key keeps. */
 const KEEP = 3;
