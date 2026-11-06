@@ -1,9 +1,10 @@
 // `outrun plan` and `outrun test`: every unit keyed, its verdict looked up, the misses (and a few
 // audited hits) shared across runners by duration, a runner's share run in batches, red units
 // rerun alone, and what the run learned written back.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { appendFile, mkdtemp, rm } from "node:fs/promises";
 import { availableParallelism, freemem, hostname, tmpdir, totalmem } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Console, Effect, Semaphore } from "effect";
 import type { Adapter, UnitResult } from "./adapters/adapter.ts";
 import { bunAdapter } from "./adapters/bun.ts";
@@ -58,6 +59,11 @@ export interface KeyOptions {
   readonly remote?: Remote | undefined;
   /** Key the command units only (no test file, no read set): `outrun lookup` and `outrun record`. */
   readonly commandsOnly?: boolean | undefined;
+  /**
+   * outrun's own files of this call (the plan, the summary, the trace), never keyed: a shard that
+   * downloaded its plan into the checkout keys the tree its plan keyed, not the tree plus plan.json.
+   */
+  readonly own?: readonly (string | undefined)[] | undefined;
 }
 
 export interface PlanOptions extends KeyOptions {
@@ -99,11 +105,39 @@ const availableMb = () => {
   return Math.max(freemem(), totalmem() / 2) / 1024 / 1024;
 };
 
+/** The checkout's files without outrun's own (paths relative to `cwd`, or absolute; real paths compared, `/tmp` is `/private/tmp` on macOS). */
+const withoutOwn = (blobs: Git.Blobs, repo: string, cwd: string, own: readonly (string | undefined)[]): Git.Blobs => {
+  const real = (path: string) => {
+    try {
+      return realpathSync(path);
+    } catch {
+      // A file not written yet (the plan's --out): its folder's real path.
+      return join(realpathSync(dirname(path)), basename(path));
+    }
+  };
+  const paths = own.flatMap((p) => {
+    if (p === undefined) return [];
+    try {
+      const rel = relative(realpathSync(repo), real(resolve(cwd, p)));
+      return rel.startsWith("..") || isAbsolute(rel) ? [] : [rel.split(sep).join("/")];
+    } catch {
+      // Its folder does not exist: it is not in the checkout either.
+      return [];
+    }
+  });
+  if (!paths.some((p) => blobs.has(p))) return blobs;
+  const kept = new Map(blobs);
+  for (const p of paths) kept.delete(p);
+  return kept;
+};
+
 export const keyUnits = (options: KeyOptions) =>
   Effect.gen(function* () {
     const t0 = now();
     const repo = yield* Git.root(options.cwd);
-    const [config, blobs] = yield* Effect.all([loadConfig(options.config ?? `${repo}/outrun.json`), Git.blobs(repo)], { concurrency: 2 });
+    const [config, blobs] = yield* Effect.all([loadConfig(options.config ?? `${repo}/outrun.json`), Git.blobs(repo)], { concurrency: 2 }).pipe(
+      Effect.map(([config, all]) => [config, withoutOwn(all, repo, options.cwd, options.own ?? [])] as const),
+    );
     const tIndex = now();
     const state = stateDir(options.env);
     // An unreadable scan cache is rebuilt: it only saves reading files again.
@@ -330,7 +364,7 @@ export interface PlanRunners {
  */
 export const plan = (options: PlanOptions & { readonly runners: PlanRunners; readonly out: string }) =>
   Effect.gen(function* () {
-    const prepared = yield* prepare(options);
+    const prepared = yield* prepare({ ...options, own: [options.out] });
     const runners = runnersFor(prepared.misses.map(toTimed), options.runners);
     const shares = runners === 0 ? [] : share(prepared.misses, prepared.audits, runners);
     const file: PlanFile = {
@@ -483,7 +517,7 @@ export const test = (options: TestOptions) =>
     let count = options.shard.count;
     if (!(count >= 1 && index >= 1 && index <= count))
       return yield* new UsageInvalid({ message: `--shard ${index}/${count}: the index is between 1 and the count` });
-    const prepared = yield* prepare(options);
+    const prepared = yield* prepare({ ...options, own: [options.plan, options.summary, options.trace] });
     const { keyed, looked, tier } = prepared;
     const { repo, config } = keyed;
     let mine: TimedUnit[];

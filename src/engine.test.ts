@@ -1,5 +1,5 @@
 // End to end: a git repository with a bun workspace, run, re-run, changed, failed.
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Exit } from "effect";
@@ -169,6 +169,35 @@ describe("outrun test", () => {
         expect(cold.runners).toBe(1);
         yield* outrunTest({ ...options(dir, state, "p1"), plan: out });
         const warm = yield* plan({ ...options(dir, state, "p2"), out, runners });
+        expect([warm.runners, warm.units]).toEqual([0, []]);
+      }),
+    60_000,
+  );
+
+  it.effect(
+    "keys none of its own files: a plan downloaded into the checkout moves no key, so a rerun plans no runner",
+    () =>
+      Effect.gen(function* () {
+        const { dir, state } = yield* setup();
+        // Every file of the checkout is in the suite's key, plan.json included if it were keyed.
+        yield* io(() =>
+          write(dir, {
+            "outrun.json": JSON.stringify({
+              inputs: ["package.json"],
+              suites: [{ name: "unit", adapter: "bun", dir: ".", tests: ["test/*.test.ts"], run: ["bun", "test"], sources: ["imports", "suite"] }],
+            }),
+          }),
+        );
+        git(dir, "commit", "-qam", "whole suite");
+        const out = `${dir}/plan.json`;
+        const runners = { max: 4, targetMs: 60_000, startMs: 1000, slots: 2 };
+        const cold = yield* plan({ ...options(dir, state, "o1"), out, runners });
+        expect(cold.runners).toBe(1);
+        const run = yield* outrunTest({ ...options(dir, state, "o1"), plan: out });
+        expect([run.ran, run.failed]).toEqual([2, []]);
+        // The rerun's plan job checks out the commit afresh: no plan.json in it.
+        yield* io(() => rm(out));
+        const warm = yield* plan({ ...options(dir, state, "o2"), out: `${state}/plan.json`, runners });
         expect([warm.runners, warm.units]).toEqual([0, []]);
       }),
     60_000,
