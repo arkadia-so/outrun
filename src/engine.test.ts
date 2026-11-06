@@ -1,5 +1,5 @@
 // End to end: a git repository with a bun workspace, run, re-run, changed, failed.
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Exit } from "effect";
@@ -226,6 +226,30 @@ describe("outrun test", () => {
         expect(yield* lookupCommand({ ...options(dir, state, "c6"), name: "build" })).toEqual({ run: false, key: before.commandKeys.build });
         yield* io(() => writeFile(`${dir}/src/math.ts`, "export const add = 1\n"));
         expect((yield* lookupCommand({ ...options(dir, state, "c7"), name: "build" })).run).toBe(true);
+      }),
+    60_000,
+  );
+
+  it.effect(
+    "records a command under its given key without reading the checkout, so a step's outputs cost the record nothing",
+    () =>
+      Effect.gen(function* () {
+        const { dir, state } = yield* setup();
+        const out = `${state}/plan.json`;
+        const runners = { max: 4, targetMs: 60_000, startMs: 1000, slots: 2 };
+        const before = yield* plan({ ...options(dir, state, "k1"), out, runners });
+        // What a build leaves in the checkout, unignored: keying would read it, and fails on this one.
+        yield* io(() => writeFile(`${dir}/src/output.bin`, "built\n"));
+        yield* io(() => chmod(`${dir}/src/output.bin`, 0o000));
+        expect(Exit.isFailure(yield* Effect.exit(recordCommand({ ...options(dir, state, "k1"), name: "build", write: false, durationMs: 1000 })))).toBe(true);
+        yield* recordCommand({ ...options(dir, state, "k1"), name: "build", write: false, durationMs: 1000, key: before.commandKeys.build });
+        yield* io(() => rm(`${dir}/src/output.bin`));
+        expect((yield* plan({ ...options(dir, state, "k2"), out, runners })).commands).toEqual({ build: "hit" });
+        expect(
+          Exit.isFailure(
+            yield* Effect.exit(recordCommand({ ...options(dir, state, "k3"), name: "nope", write: false, durationMs: 1, key: before.commandKeys.build })),
+          ),
+        ).toBe(true);
       }),
     60_000,
   );

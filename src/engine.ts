@@ -808,9 +808,15 @@ export const lookupCommand = (options: KeyOptions & { readonly name: string; rea
     return { run, key: command.key };
   });
 
+/** Pure: the command unit of `config` named `name`. */
+const commandNamed = (config: Config, name: string) => (config.commands ?? []).find((c) => c.name === name);
+
 /**
- * `outrun record <command>`: the step a command unit names passed in this job; its key is computed
- * again here (the checkout is the plan's) and its pass written, with this run's tier.
+ * `outrun record <command>`: the step a command unit names passed in this job; its pass is written,
+ * with this run's tier, under the key its lookup or plan gave (`--key`), else under the key computed
+ * again here (the checkout is the plan's). Given the key, nothing is hashed: the step's outputs
+ * (a DerivedData, a build folder) may be thousands of files git does not ignore, which keying
+ * would read for a key it then drops (Flipcash: 26,355 inputs, 12 s, ARK-81).
  */
 export const recordCommand = (
   options: KeyOptions & {
@@ -824,14 +830,23 @@ export const recordCommand = (
   },
 ) =>
   Effect.gen(function* () {
-    const keyed = yield* keyUnits({ ...options, commandsOnly: true });
-    const found = keyed.commands.find((c) => c.name === options.name);
-    if (!found) return yield* new UsageInvalid({ message: `${options.name}: no such command in outrun.json` });
     if (options.key !== undefined && !/^[0-9a-f]{64}$/.test(options.key)) return yield* new UsageInvalid({ message: `--key ${options.key}: not a key` });
-    if (options.failed && !found.command.quarantined)
-      return yield* new UsageInvalid({ message: `${options.name}: a failure is recorded only for a quarantined command (outrun.json "quarantined": true)` });
+    const given = options.key;
     // The plan's key: the step may have changed the checkout (a build writes into it) since.
-    const command = options.key === undefined ? found : { ...found, key: options.key };
+    const keyed =
+      given === undefined
+        ? yield* keyUnits({ ...options, commandsOnly: true })
+        : yield* Effect.gen(function* () {
+            const repo = yield* Git.root(options.cwd);
+            const config = yield* loadConfig(options.config ?? `${repo}/outrun.json`);
+            return { repo, config, state: stateDir(options.env), commands: [] as readonly KeyedCommand[] };
+          });
+    const unit = commandNamed(keyed.config, options.name);
+    if (!unit) return yield* new UsageInvalid({ message: `${options.name}: no such command in outrun.json` });
+    if (options.failed && !unit.quarantined)
+      return yield* new UsageInvalid({ message: `${options.name}: a failure is recorded only for a quarantined command (outrun.json "quarantined": true)` });
+    const command =
+      given === undefined ? (keyed.commands.find((c) => c.name === options.name) as KeyedCommand) : { name: unit.name, key: given, inputs: undefined };
     const tier = tierOf(options.env, keyed.config.trustedRef ?? "refs/heads/main", hostname());
     const at = Math.floor(Date.now() / 1000);
     const commit = yield* Git.head(keyed.repo);
@@ -857,5 +872,7 @@ export const recordCommand = (
       );
       if (refused > 0) yield* Console.error(`outrun: the remote cache refused the command's ${verdict.outcome}`);
     }
-    yield* Console.error(`outrun: ${command.name} ${options.failed ? "failed (quarantined, recorded)" : "passed"} (${command.inputs} inputs, tier ${tier})`);
+    yield* Console.error(
+      `outrun: ${command.name} ${options.failed ? "failed (quarantined, recorded)" : "passed"} (${command.inputs === undefined ? "the given key" : `${command.inputs} inputs`}, tier ${tier})`,
+    );
   });
