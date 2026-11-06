@@ -25,11 +25,16 @@ export interface CacheEntry {
   readonly tag: string;
 }
 
-// Measured from a fleet runner (ARK-81, 2026-11-03): the server answers a 100-hash query in 3.6 s
-// (it heads each hash in storage, a few at a time) and a GET or PUT in 0.3-0.8 s, while 16
-// parallel requests take as long as one. So the client asks small, as wide as the client to the
-// cache allows (upstream.ts: wider bursts of new connections lose SYNs on the fleet).
-const QUERY_SIZE = 10;
+// The most hashes the server's batch query answers for (platform/turbo-cache MAX_QUERY). The client
+// asks for that many at once: a lookup is bound by its round trips, since it may have only
+// UPSTREAM_CONCURRENCY requests in flight (upstream.ts: wider bursts of new connections lose SYNs
+// on the fleet). Measured on opencode's plan (ARK-81, 2026-11-06, ~3,950 hashes): in 10-hash
+// queries, 395 requests took 48-67 s, each 0.13 s (p50) in the Worker and 0.6-1.0 s more outside it.
+const QUERY_SIZE = 100;
+// A 100-hash query heads up to 200 objects six at a time, and may decide its caller's access first
+// (2-15 s when it does, outrun/control-plane verdict-cache.ts): more than a request's default
+// 20 s, and a query that times out costs its hashes, so up to a hundred units run again.
+const QUERY_TIMEOUT_MS = 60_000;
 
 const sha256 = (text: string) => new Bun.CryptoHasher("sha256").update(text).digest("hex");
 /** The artifact holding a unit's last measured duration. */
@@ -50,7 +55,12 @@ export const query = (remote: Remote, hashes: readonly string[]) =>
     const answers = yield* Effect.forEach(
       chunks,
       (chunk) =>
-        request(remote, "/v8/artifacts", { method: "POST", body: JSON.stringify({ hashes: chunk }), headers: { "content-type": "application/json" } }).pipe(
+        request(
+          remote,
+          "/v8/artifacts",
+          { method: "POST", body: JSON.stringify({ hashes: chunk }), headers: { "content-type": "application/json" } },
+          QUERY_TIMEOUT_MS,
+        ).pipe(
           Effect.flatMap((response) =>
             response.ok
               ? Effect.try({
