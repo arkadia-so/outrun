@@ -10,6 +10,9 @@
 //   outrun record <command> [--key k] [--since epoch-seconds] [--no-write] [--failed]
 //                                the command unit's step passed: write its pass
 //   outrun units [--json]        every unit, its key and how many files its key holds
+//   --e2e (plan, test, units)    no outrun.json: the checkout's TesterArmy e2e configs are the suites
+//   outrun junit-merge --out f <reports...>
+//                                one JUnit report from several (a run's shards)
 //   outrun xcode-reads --trace-dir d --build unit [--run unit]... --out file
 //                                a traced xcodebuild's per-target read sets as each xcode test file's
 //                                observation, for `outrun test --trace`
@@ -27,8 +30,10 @@ import { Argument, CliError, Command, Flag } from "effect/cli";
 import pkg from "../package.json" with { type: "json" };
 import { BAZEL, buildCacheApp, NX } from "./build-cache.ts";
 import { githubOidc } from "./cache.ts";
+import { e2eEnvLines } from "./e2e-env.ts";
 import { blocking, keyUnits, lookupCommand, plan, recordCommand, test } from "./engine.ts";
-import { CacheUnavailable, TestsFailed, UsageInvalid } from "./errors.ts";
+import { CacheUnavailable, FileFailed, TestsFailed, UsageInvalid } from "./errors.ts";
+import { mergeJunit, parseJunit } from "./junit.ts";
 import type { Remote } from "./upstream.ts";
 import { xcodeReads } from "./xcode-reads.ts";
 
@@ -62,6 +67,11 @@ const local = Flag.Boolean("local").pipe(Flag.withDescription("ignore the remote
 const slots = Flag.Int("slots").pipe(Flag.withDescription("batches a runner runs at once (default: its CPUs)"), Flag.optional);
 const only = Flag.String("only").pipe(Flag.withDescription("only the units under this path (repeatable)"), Flag.atLeast(0));
 
+const e2e = Flag.Boolean("e2e").pipe(
+  Flag.withDescription("no outrun.json: every TesterArmy e2e.config of the checkout is a suite, its tests listed by its CLI"),
+  Flag.withDefault(false),
+);
+
 const config = Flag.String("config").pipe(Flag.withDescription("the configuration (default: outrun.json at the repository's root)"), Flag.optional);
 
 const testCommand = Command.make(
@@ -78,6 +88,7 @@ const testCommand = Command.make(
     trace: Flag.String("trace").pipe(Flag.withDescription("the tracer's JSON lines for this run: read sets to record"), Flag.optional),
     summary: Flag.String("summary").pipe(Flag.withDescription("write the run's summary (JSON) there"), Flag.optional),
     only,
+    e2e,
   },
   (flags) =>
     Effect.gen(function* () {
@@ -97,6 +108,7 @@ const testCommand = Command.make(
         summary: Option.getOrUndefined(flags.summary),
         env,
         only: flags.only.length > 0 ? flags.only : undefined,
+        e2e: flags.e2e,
       });
       const count = blocking(summary);
       if (count > 0) return yield* new TestsFailed({ count });
@@ -108,13 +120,17 @@ const planCommand = Command.make(
   {
     config,
     out: Flag.String("out").pipe(Flag.withDescription("where the plan is written")),
-    maxRunners: Flag.Int("max-runners").pipe(Flag.withDescription("the most runners to start"), Flag.withDefault(8)),
-    target: Flag.Finite("target").pipe(Flag.withDescription("the wall time to aim for, in seconds"), Flag.withDefault(120)),
-    start: Flag.Finite("start").pipe(Flag.withDescription("what starting a runner costs before its first test, in seconds"), Flag.withDefault(30)),
-    slots: Flag.Int("slots").pipe(Flag.withDescription("batches each runner runs at once"), Flag.withDefault(4)),
+    maxRunners: Flag.Int("max-runners").pipe(Flag.withDescription("the most runners to start (default 8; 16 with --e2e)"), Flag.optional),
+    target: Flag.Finite("target").pipe(Flag.withDescription("the wall time to aim for, in seconds (default 120; 300 with --e2e)"), Flag.optional),
+    start: Flag.Finite("start").pipe(
+      Flag.withDescription("what starting a runner costs before its first test, in seconds (default 30; 60 with --e2e)"),
+      Flag.optional,
+    ),
+    slots: Flag.Int("slots").pipe(Flag.withDescription("batches each runner runs at once (default 4; 1 with --e2e)"), Flag.optional),
     local,
     audit,
     only,
+    e2e,
   },
   (flags) =>
     Effect.gen(function* () {
@@ -127,7 +143,15 @@ const planCommand = Command.make(
         audit: flags.audit,
         only: flags.only.length > 0 ? flags.only : undefined,
         out: flags.out,
-        runners: { max: flags.maxRunners, targetMs: flags.target * 1000, startMs: flags.start * 1000, slots: flags.slots },
+        e2e: flags.e2e,
+        // An e2e runner costs its pickup and setup (browsers, a simulator) and runs one CLI at a time;
+        // 16 is the most macOS VMs one run takes of the fleet (DESIGN.md §13.3).
+        runners: {
+          max: Option.getOrElse(flags.maxRunners, () => (flags.e2e ? 16 : 8)),
+          targetMs: Option.getOrElse(flags.target, () => (flags.e2e ? 300 : 120)) * 1000,
+          startMs: Option.getOrElse(flags.start, () => (flags.e2e ? 60 : 30)) * 1000,
+          slots: Option.getOrElse(flags.slots, () => (flags.e2e ? 1 : 4)),
+        },
       });
     }),
 ).pipe(Command.withDescription("Look every unit up once, before any test job: how many runners the misses need, and which runs what"));
@@ -179,10 +203,16 @@ const lookupCommandCommand = Command.make(
 
 const unitsCommand = Command.make(
   "units",
-  { config, json: Flag.Boolean("json").pipe(Flag.withDefault(false)), file: Argument.String("file").pipe(Argument.variadic()) },
+  { config, e2e, json: Flag.Boolean("json").pipe(Flag.withDefault(false)), file: Argument.String("file").pipe(Argument.variadic()) },
   (flags) =>
     Effect.gen(function* () {
-      const keyed = yield* keyUnits({ cwd: process.cwd(), config: Option.getOrUndefined(flags.config), env, remote: yield* remoteOf(false) });
+      const keyed = yield* keyUnits({
+        cwd: process.cwd(),
+        config: Option.getOrUndefined(flags.config),
+        env,
+        remote: yield* remoteOf(false),
+        e2e: flags.e2e,
+      });
       const units = flags.file.length > 0 ? keyed.units.filter((u) => flags.file.some((f) => u.id.endsWith(f))) : keyed.units;
       for (const u of units)
         yield* Console.log(
@@ -251,6 +281,51 @@ const xcodeReadsCommand = Command.make(
     }),
 ).pipe(Command.withDescription("Each xcode test file's observation from a traced build's per-target read sets"));
 
+const junitMergeCommand = Command.make(
+  "junit-merge",
+  {
+    out: Flag.String("out").pipe(Flag.withDescription("where the merged report is written")),
+    name: Flag.String("name").pipe(Flag.withDescription("the report's name"), Flag.withDefault("outrun")),
+    reports: Argument.String("report").pipe(Argument.withDescription("JUnit reports (a missing one is skipped)"), Argument.variadic()),
+  },
+  (flags) =>
+    Effect.gen(function* () {
+      const texts = yield* Effect.forEach(flags.reports, (path) =>
+        Effect.tryPromise({
+          try: async () => ((await Bun.file(path).exists()) ? await Bun.file(path).text() : ""),
+          catch: () => new FileFailed({ message: `${path}: unreadable` }),
+        }),
+      );
+      const merged = mergeJunit(texts, flags.name);
+      yield* Effect.tryPromise({
+        try: () => Bun.write(flags.out, merged),
+        catch: () => new FileFailed({ message: `${flags.out}: not writable` }),
+      });
+      // On stdout, a summary in Markdown (a job's $GITHUB_STEP_SUMMARY).
+      const files = [...parseJunit(merged)].filter(([file]) => file !== "run");
+      const failed = files.filter(([, r]) => r.failures > 0);
+      const lines = [
+        `### ${flags.name}`,
+        "",
+        `${files.length} test files from ${texts.filter(Boolean).length} reports, ${failed.length} failed.`,
+        ...failed.map(([file, r]) => `- ❌ \`${file}\`: ${r.failures} of ${r.tests} tests failed`),
+      ];
+      yield* Console.log(lines.join("\n"));
+    }),
+).pipe(Command.withDescription("One JUnit report from several: a run's shards, merged for its summary"));
+
+const e2eEnvCommand = Command.make("e2e-env", {}, () =>
+  Effect.gen(function* () {
+    const lines = e2eEnvLines(env.VARIABLES ?? "", env.NAMES ?? "", env.SECRETS ?? "", `OUTRUN_EOF_${crypto.randomUUID()}`);
+    if (typeof lines !== "string") return yield* lines;
+    if (lines) yield* Console.log(lines.replace(/\n$/, ""));
+  }),
+).pipe(
+  Command.withDescription(
+    "$GITHUB_ENV's lines for the e2e workflow: VARIABLES (NAME=value per line) and the secrets NAMES lists, read from SECRETS (the secrets context as JSON)",
+  ),
+);
+
 const outrun = Command.make("outrun").pipe(
   Command.withDescription("outrun's CI engine: test files as units, keyed by content, verdicts cached, misses batched and balanced across runners"),
   Command.withSubcommands([
@@ -262,6 +337,8 @@ const outrun = Command.make("outrun").pipe(
     xcodeReadsCommand,
     nxCacheCommand,
     bazelCacheCommand,
+    junitMergeCommand,
+    e2eEnvCommand,
   ]),
 );
 

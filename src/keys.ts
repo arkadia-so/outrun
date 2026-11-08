@@ -19,7 +19,7 @@
 import { posix } from "node:path";
 import { type CommandUnit, type Config, DEFAULT_SOURCES, type Suite } from "./config.ts";
 import type { Blobs } from "./git.ts";
-import { keyedEnv } from "./machine.ts";
+import { hashedEnv, keyedEnv } from "./machine.ts";
 import type { ImportGraph } from "./sources/imports.ts";
 
 /** Bumped when the key's recipe changes, so no verdict of the old recipe is replayed. */
@@ -173,7 +173,7 @@ export const computeUnits = (context: KeyContext): Unit[] => {
     const tracedFiles = [...global, ...rootClosure.files, ...declared];
     const tracedDigest = sha256(JSON.stringify(["traced", suite.name, contents(blobs, tracedFiles)]));
     const toolchain = context.toolchain[suite.adapter] ?? "";
-    const envParts = keyedEnv(env, [...(config.env ?? []), ...(suite.env ?? [])]);
+    const envParts = [...keyedEnv(env, [...(config.env ?? []), ...(suite.env ?? [])]), ...hashedEnv(env, suite.hashedEnv ?? [])];
     const run = [...suite.run, ...(suite.xcode ? [JSON.stringify(suite.xcode)] : [])];
     for (const id of matching(blobs, suite.dir, suite.tests, suite.exclude)) {
       const file = suite.dir === "." ? id : posix.relative(suite.dir, id);

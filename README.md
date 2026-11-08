@@ -163,6 +163,55 @@ A repository on Nx keeps Nx as its task runner. `outrun nx-cache --port 7070` se
 
 A repository on Bazel keeps Bazel the same way. `outrun bazel-cache --port 7071` serves Bazel's HTTP remote cache (GET, HEAD and PUT on `/ac/` and `/cas/`), stored in outrun's cache under the same rules; point Bazel at it with `--remote_cache=http://127.0.0.1:7071`.
 
+## End-to-end tests
+
+`--e2e` runs a repository's [TesterArmy e2e](https://www.npmjs.com/package/e2e) suites with no
+`outrun.json`: every `e2e.config.{ts,mts,js,mjs}` git knows is a suite, and each test file its CLI
+lists (`e2e list --reporter json`) is a unit. A runner's share of a suite runs as one `e2e run`
+with the config's own workers; a file's verdict is its JUnit testsuite.
+
+```sh
+outrun plan --e2e --out plan.json   # defaults for e2e: --target 300 --start 60 --max-runners 16 --slots 1
+outrun test --e2e --plan plan.json --shard 2/4
+outrun junit-merge --out e2e.xml shard-*/**/junit.xml   # one report; a Markdown summary on stdout
+```
+
+A unit's key holds every file of its config's folder (the app, when the config sits in its
+package), its import closure, the lockfiles, Node's version, the machine, and a digest of every
+variable the folder reads by name (`process.env.ACME_URL`): another deployment is another app under
+test. A pass replays for 24 hours, since the app may change without a commit. The tests get the
+job's whole environment, and a red file is not run again alone (the config's `retries` decide).
+`--only <path>` keeps the configs whose folder holds or lies under the path.
+
+In GitHub Actions, the reusable workflow plans, fans out and merges the reports:
+
+```yaml
+jobs:
+  e2e:
+    uses: arkadia-so/outrun/.github/workflows/e2e.yml@v1
+    permissions: { contents: read, id-token: write }
+    with:
+      runs-on: outrun-linux-arm64          # outrun-macos for an iOS simulator target
+      install: npm ci                      # dependencies, e2e's CLI among them
+      setup: npx playwright install --with-deps chromium
+      env: ACME_URL=https://staging.acme.example
+      env-secrets: ACME_MODEL_TOKEN        # secrets the tests read, by name
+    secrets: inherit
+```
+
+The repository needs `e2e` in its dependencies, Node on the runner, `.e2e/` git-ignored (outrun
+writes each batch's report under `.e2e/outrun-*`, inside the project root as the CLI requires), and
+the token its config's model needs. The model is the config's; an OpenAI-compatible gateway such as
+`https://ai.trait.so/v1` with a role alias (`fast`) is one line of it:
+
+```ts
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import type { E2EConfig } from "e2e";
+
+const gateway = createOpenAICompatible({ name: "trait", baseURL: "https://ai.trait.so/v1", apiKey: process.env.ACME_MODEL_TOKEN });
+export default { /* tests, targets */ agents: { default: { model: gateway("fast") } } } satisfies E2EConfig;
+```
+
 ## License
 
 MIT or Apache-2.0.

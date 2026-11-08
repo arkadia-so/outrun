@@ -79,5 +79,5 @@ export const parseTag = (text: string): Tag => {
 };
 
 /** Pure: whether an artifact tagged so may be replayed by a run of `tier` at `nowMs`. */
-export const usable = (tag: Tag, tier: Tier, nowMs: number) =>
-  tag.at !== undefined && nowMs - tag.at * 1000 < MAX_AGE_MS && tag.tier !== undefined && readable(tier).includes(tag.tier);
+export const usable = (tag: Tag, tier: Tier, nowMs: number, maxAgeMs = MAX_AGE_MS) =>
+  tag.at !== undefined && nowMs - tag.at * 1000 < Math.min(maxAgeMs, MAX_AGE_MS) && tag.tier !== undefined && readable(tier).includes(tag.tier);

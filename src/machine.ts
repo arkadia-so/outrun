@@ -41,6 +41,15 @@ const PASSED_ENV = [
 /** Pure: the keyed variables, sorted, with their values (absent ones as empty). */
 export const keyedEnv = (env: Env, extra: readonly string[]) => [...new Set([...KEYED_ENV, ...extra])].sort().map((n) => [n, env[n] ?? ""] as const);
 
+/**
+ * Pure: variables keyed by a digest of their value (absent ones as empty), sorted: a key or a plan
+ * holding them never shows the value.
+ */
+export const hashedEnv = (env: Env, names: readonly string[]) =>
+  [...new Set(names)]
+    .sort()
+    .map((n) => [n, env[n] === undefined ? "" : `sha256:${new Bun.CryptoHasher("sha256").update(env[n] as string).digest("hex")}`] as const);
+
 /** Pure: the environment of a unit's process: only the allow-list, and its own TMPDIR. */
 export const unitEnv = (env: Env, extra: readonly string[], tmp: string): Record<string, string> => {
   const out: Record<string, string> = {};

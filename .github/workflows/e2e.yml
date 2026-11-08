@@ -1,0 +1,191 @@
+name: outrun e2e
+# Any TesterArmy e2e suite, fanned out over outrun's runners with no configuration (README, "End-to-end
+# tests"). Every e2e.config of the checkout is a suite and each of its test files a unit: a unit whose
+# key already passed is replayed, the others are spread over as many runners as the wall time aims for,
+# by the durations outrun learned, and their JUnit reports are merged into one.
+#
+#   jobs:
+#     e2e:
+#       uses: arkadia-so/outrun/.github/workflows/e2e.yml@v1
+#       permissions: { contents: read, id-token: write }
+#       with:
+#         install: npm ci
+#         setup: npx playwright install --with-deps chromium
+#         env-secrets: ACME_E2E_TOKEN
+#       secrets: inherit
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: The runners' label (outrun-linux-arm64 for web targets, outrun-macos for an iOS simulator)
+        type: string
+        default: outrun-linux-arm64
+      node-version:
+        description: The Node e2e's CLI runs on (actions/setup-node; from the runner's tool cache when it has it)
+        type: string
+        default: "24"
+      bun-version:
+        description: A Bun for the install and setup commands (oven-sh/setup-bun), when they need one
+        type: string
+        default: ""
+      install:
+        description: Installs the repository's dependencies, e2e's CLI among them (run by every job but the report)
+        type: string
+        required: true
+      setup:
+        description: What the tests need beyond the dependencies (a browser, an app built for the simulator); run jobs only
+        type: string
+        default: ""
+      env:
+        description: Variables for the tests, one NAME=value per line (not secret; outrun keys the tests on them)
+        type: string
+        default: ""
+      env-secrets:
+        description: Names of the caller's secrets given to the tests as variables of the same name, separated by spaces
+        type: string
+        default: ""
+      only:
+        description: Only the e2e configs whose folder holds or lies under one of these paths, separated by spaces
+        type: string
+        default: ""
+      max-runners:
+        description: The most runners one run takes
+        type: number
+        default: 16
+      target:
+        description: The wall time to aim for, in seconds, runner start included
+        type: number
+        default: 300
+      timeout-minutes:
+        description: Each run job's limit
+        type: number
+        default: 30
+
+permissions:
+  contents: read
+  id-token: write # the verdict cache authenticates each job by its OIDC token
+
+env:
+  OUTRUN_CACHE_URL: https://cache.outrun.sh
+
+jobs:
+  plan:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 15
+    outputs:
+      runners: ${{ steps.plan.outputs.runners }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: arkadia-so/outrun@v1
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - if: inputs.bun-version != ''
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ inputs.bun-version }}
+      - name: Environment
+        shell: bash
+        env:
+          VARIABLES: ${{ inputs.env }}
+          NAMES: ${{ inputs.env-secrets }}
+          SECRETS: ${{ toJSON(secrets) }}
+        run: outrun e2e-env >>"$GITHUB_ENV"
+      - name: Install
+        shell: bash
+        run: ${{ inputs.install }}
+      - id: plan
+        shell: bash
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          only=()
+          for path in $ONLY; do only+=(--only "$path"); done
+          outrun plan --e2e --out "$RUNNER_TEMP/plan.json" --max-runners ${{ inputs.max-runners }} --target ${{ inputs.target }} "${only[@]}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: outrun-e2e-plan
+          path: ${{ runner.temp }}/plan.json
+          retention-days: 1
+
+  run:
+    needs: plan
+    if: needs.plan.outputs.runners != '0'
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: arkadia-so/outrun@v1
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - if: inputs.bun-version != ''
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ inputs.bun-version }}
+      - name: Environment
+        shell: bash
+        env:
+          VARIABLES: ${{ inputs.env }}
+          NAMES: ${{ inputs.env-secrets }}
+          SECRETS: ${{ toJSON(secrets) }}
+        run: outrun e2e-env >>"$GITHUB_ENV"
+      - name: Install
+        shell: bash
+        run: ${{ inputs.install }}
+      - name: Setup
+        if: inputs.setup != ''
+        shell: bash
+        run: ${{ inputs.setup }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: outrun-e2e-plan
+          path: ${{ runner.temp }}/plan
+      - name: e2e
+        shell: bash
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          only=()
+          for path in $ONLY; do only+=(--only "$path"); done
+          outrun test --e2e --plan "$RUNNER_TEMP/plan/plan.json" --shard ${{ matrix.shard }}/${{ needs.plan.outputs.runners }} "${only[@]}"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: outrun-e2e-${{ matrix.shard }}
+          path: "**/.e2e/outrun-*/"
+          if-no-files-found: ignore
+          retention-days: 7
+
+  report:
+    needs: [plan, run]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.runners != '0'
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 10
+    steps:
+      - uses: arkadia-so/outrun@v1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: outrun-e2e-[0-9]*
+          path: ${{ runner.temp }}/shards
+      - name: Merge
+        shell: bash
+        run: |
+          mapfile -t reports < <(find "$RUNNER_TEMP/shards" -name junit.xml | sort)
+          outrun junit-merge --name "${{ github.repository }} e2e" --out "$RUNNER_TEMP/e2e-junit.xml" "${reports[@]}" >>"$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: outrun-e2e-report
+          path: ${{ runner.temp }}/e2e-junit.xml
+          retention-days: 30
+      - name: Verdict
+        if: needs.run.result != 'success'
+        shell: bash
+        run: |
+          echo "outrun e2e: a shard failed (${{ needs.run.result }})" >&2
+          exit 1

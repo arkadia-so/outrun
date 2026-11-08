@@ -35,3 +35,13 @@ describe("tags", () => {
     expect(usable({}, "trusted", at * 1000)).toBe(false);
   });
 });
+
+describe("a suite's own replay window", () => {
+  it("keeps a pass shorter than the default, never longer", () => {
+    const at = Date.now();
+    const tag = { run: "r", at: (at - 2 * 3600 * 1000) / 1000, tier: "trusted" as const };
+    expect(usable(tag, "trusted", at)).toBe(true);
+    expect(usable(tag, "trusted", at, 3600 * 1000)).toBe(false);
+    expect(usable({ ...tag, at: (at - 8 * 24 * 3600 * 1000) / 1000 }, "trusted", at, 30 * 24 * 3600 * 1000)).toBe(false);
+  });
+});

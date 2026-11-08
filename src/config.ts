@@ -29,7 +29,7 @@ export type KeySource = typeof KeySource.Type;
 
 const Suite = Schema.Struct({
   name: Schema.String,
-  adapter: Schema.Literals(["bun", "vitest", "pytest", "xcode", "catch2"]),
+  adapter: Schema.Literals(["bun", "vitest", "pytest", "xcode", "catch2", "e2e"]),
   /** The suite's folder, relative to the repository's root; the batch runs there. */
   dir: Schema.String,
   /** Globs of the test files, relative to dir. */
@@ -40,6 +40,23 @@ const Suite = Schema.Struct({
   roots: Schema.optional(Schema.Array(Schema.String)),
   inputs: Schema.optional(Schema.Array(Schema.String)),
   env: Schema.optional(Schema.Array(Schema.String)),
+  /**
+   * Variables keyed by a digest of their value, never the value itself (a URL with a token, a test
+   * account): the plan file, which a job uploads, names them without showing them.
+   */
+  hashedEnv: Schema.optional(Schema.Array(Schema.String)),
+  /**
+   * A batch gets the job's whole environment rather than the allow-list (machine.ts): a suite that
+   * is not hermetic, as an end-to-end suite reaching a deployed app with the job's secrets.
+   */
+  inheritEnv: Schema.optional(Schema.Boolean),
+  /**
+   * Whether a red or unfinished unit runs again alone before it is reported (default: true, which
+   * tells a failure from a flaky test). False for a runner that retries on its own.
+   */
+  rerunAlone: Schema.optional(Schema.Boolean),
+  /** How long a pass of this suite is replayed, in hours (default: 7 days). */
+  maxAgeHours: Schema.optional(Schema.Number),
   /**
    * What a unit's strong keys hold besides the global inputs: `imports` (its import closure),
    * `declared` (the suite's inputs), or `suite` (every file of the suite's folder: the safe default

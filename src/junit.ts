@@ -110,3 +110,30 @@ export const parseJunitCases = (xml: string, by: "file" | "name" = "file"): Map<
   }
   return out;
 };
+
+/**
+ * Pure: one JUnit document from several (a run's shards): every top-level <testsuite> of each, in
+ * order, under one <testsuites> whose counts are their sums.
+ */
+export const mergeJunit = (reports: readonly string[], name: string): string => {
+  const suites: string[] = [];
+  const total = { tests: 0, failures: 0, errors: 0, skipped: 0, time: 0 };
+  for (const xml of reports)
+    for (const m of xml.matchAll(/<testsuite\b([^>]*?)(?:\/>|>[\s\S]*?<\/testsuite>)/g)) {
+      suites.push(m[0]);
+      const attrs = m[1] ?? "";
+      total.tests += Number(attribute(attrs, "tests") ?? 0);
+      total.failures += Number(attribute(attrs, "failures") ?? 0);
+      total.errors += Number(attribute(attrs, "errors") ?? 0);
+      total.skipped += Number(attribute(attrs, "skipped") ?? 0);
+      total.time += Number(attribute(attrs, "time") ?? 0);
+    }
+  const escaped = name.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    `<testsuites name="${escaped}" tests="${total.tests}" failures="${total.failures}" errors="${total.errors}" skipped="${total.skipped}" time="${total.time.toFixed(3)}">`,
+    ...suites.map((s) => `  ${s}`),
+    "</testsuites>",
+    "",
+  ].join("\n");
+};

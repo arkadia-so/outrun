@@ -9,17 +9,19 @@ import { Console, Effect, Semaphore } from "effect";
 import type { Adapter, UnitResult } from "./adapters/adapter.ts";
 import { bunAdapter } from "./adapters/bun.ts";
 import { catch2Adapter } from "./adapters/catch2.ts";
+import { e2eAdapter } from "./adapters/e2e.ts";
 import { pytestAdapter } from "./adapters/pytest.ts";
 import { vitestAdapter } from "./adapters/vitest.ts";
 import { xcodeAdapter } from "./adapters/xcode.ts";
 import { batches, fillIdle, runnersFor, shard } from "./balance.ts";
 import { type CacheEntry, divergenceKey, LocalCache, type Put, put, quarantineKey, query, timingKey } from "./cache.ts";
 import { type Config, loadConfig, type Suite } from "./config.ts";
+import { discoverE2e } from "./discover.ts";
 import { FileFailed, UsageInvalid } from "./errors.ts";
 import { exec } from "./exec.ts";
 import * as Git from "./git.ts";
 import { computeCommands, computeUnits, type KeyedCommand, type ReadSet, tracedKey, type Unit } from "./keys.ts";
-import { keyedEnv, machineFingerprint, unitEnv } from "./machine.ts";
+import { hashedEnv, keyedEnv, machineFingerprint, unitEnv } from "./machine.ts";
 import { loadReadSets, saveReadSets } from "./readsets.ts";
 import { ImportGraph, scanSource } from "./sources/imports.ts";
 import { parseObserved, readSetOf } from "./sources/observed.ts";
@@ -33,6 +35,7 @@ const ADAPTERS: Record<Suite["adapter"], Adapter> = {
   pytest: pytestAdapter,
   xcode: xcodeAdapter,
   catch2: catch2Adapter,
+  e2e: e2eAdapter,
 };
 
 /** At most this many red units are rerun alone (a broken commit failing hundreds would double its run). */
@@ -64,12 +67,15 @@ export interface KeyOptions {
    * downloaded its plan into the checkout keys the tree its plan keyed, not the tree plus plan.json.
    */
   readonly own?: readonly (string | undefined)[] | undefined;
+  /** The configuration is the checkout's TesterArmy e2e configs (discover.ts), not outrun.json. */
+  readonly e2e?: boolean | undefined;
+  /** Only the units under these paths; with `e2e`, only the configs whose folder overlaps them. */
+  readonly only?: readonly string[] | undefined;
 }
 
 export interface PlanOptions extends KeyOptions {
   /** Identifies this run: its shards ignore what it wrote itself. */
   readonly runId: string;
-  readonly only?: readonly string[] | undefined;
   /** The share of hits re-executed to check the cache (on idle capacity only). */
   readonly audit: number;
   /** Batches a runner runs at once (default: its CPUs). */
@@ -90,6 +96,7 @@ export interface TestOptions extends PlanOptions {
 }
 
 const now = () => performance.now();
+const withoutUndefined = (env: Env) => Object.fromEntries(Object.entries(env).filter((e): e is [string, string] => e[1] !== undefined));
 const seconds = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
 const sha256 = (text: string) => new Bun.CryptoHasher("sha256").update(text).digest("hex");
 
@@ -135,9 +142,14 @@ export const keyUnits = (options: KeyOptions) =>
   Effect.gen(function* () {
     const t0 = now();
     const repo = yield* Git.root(options.cwd);
-    const [config, blobs] = yield* Effect.all([loadConfig(options.config ?? `${repo}/outrun.json`), Git.blobs(repo)], { concurrency: 2 }).pipe(
-      Effect.map(([config, all]) => [config, withoutOwn(all, repo, options.cwd, options.own ?? [])] as const),
-    );
+    const [config, blobs] = options.e2e
+      ? yield* Git.blobs(repo).pipe(
+          Effect.map((all) => withoutOwn(all, repo, options.cwd, options.own ?? [])),
+          Effect.flatMap((blobs) => discoverE2e(repo, blobs, options.env, options.only).pipe(Effect.map((config) => [config, blobs] as const))),
+        )
+      : yield* Effect.all([loadConfig(options.config ?? `${repo}/outrun.json`), Git.blobs(repo)], { concurrency: 2 }).pipe(
+          Effect.map(([config, all]) => [config, withoutOwn(all, repo, options.cwd, options.own ?? [])] as const),
+        );
     const tIndex = now();
     const state = stateDir(options.env);
     // An unreadable scan cache is rebuilt: it only saves reading files again.
@@ -239,11 +251,11 @@ const lookup = (
       );
     const at = Date.now();
     // An artifact this run may trust: fresh, of a tier it reads, not written by this run itself.
-    const valid = (hash: string) =>
+    const valid = (hash: string, maxAgeMs?: number) =>
       [remoteEntries.get(hash), localEntries.get(hash)].some((e) => {
         if (!e) return false;
         const tag = parseTag(e.tag);
-        return usable(tag, tier, at) && tag.run !== runId;
+        return usable(tag, tier, at, maxAgeMs) && tag.run !== runId;
       });
     const diverged = new Set([...suites].filter(([, hash]) => valid(hash)).map(([suite]) => suite));
     const quarantined = new Set(units.filter((u) => valid(quarantine.get(u.id) as string)).map((u) => u.id));
@@ -251,7 +263,8 @@ const lookup = (
     const previous = new Map<string, number | undefined>();
     for (const u of units) {
       if (u.cacheable && !quarantined.has(u.id) && !diverged.has(u.suite.name)) {
-        const hit = u.candidates.find(valid);
+        const maxAgeMs = u.suite.maxAgeHours === undefined ? undefined : u.suite.maxAgeHours * 3600 * 1000;
+        const hit = u.candidates.find((c) => valid(c, maxAgeMs));
         if (hit) hits.set(u.id, hit);
       }
       const t = remoteEntries.get(timing.get(u.id) as string) ?? localEntries.get(timing.get(u.id) as string);
@@ -272,7 +285,7 @@ const lookup = (
     const durations = new Map(units.map((u) => [u.id, previous.get(u.id) ?? medians.get(u.suite.name) ?? u.suite.defaultMs ?? 1000]));
     // Remember what the remote knew, so the next run here needs no network.
     if (remoteEntries.size > 0) yield* local.set(remoteEntries).pipe(Effect.catchTag("FileFailed", () => Effect.void));
-    const commandHits = new Set(commands.map((c) => c.key).filter(valid));
+    const commandHits = new Set(commands.map((c) => c.key).filter((k) => valid(k)));
     return { hits, durations, previous, timing, quarantined, diverged, commandHits } satisfies Looked;
   });
 
@@ -308,6 +321,17 @@ const prepare = (options: PlanOptions) =>
 
 const toTimed = (u: TimedUnit) => ({ ...u, suite: u.suite.name, unit: u });
 
+/** Pure: each suite's units as one batch, longest first within it. */
+const oneBatchPerSuite = (units: readonly TimedUnit[]) => {
+  const by = new Map<string, TimedUnit[]>();
+  for (const u of units) by.set(u.suite.name, [...(by.get(u.suite.name) ?? []), u]);
+  return [...by].map(([suite, us]) => ({
+    suite,
+    expectedMs: us.reduce((a, u) => a + u.durationMs, 0),
+    units: [...us].sort((a, b) => b.durationMs - a.durationMs).map((u) => ({ unit: u })),
+  }));
+};
+
 /** What a started runner may spend on audits even with no miss to run (ms of work). */
 const AUDIT_FLOOR_MS = 10_000;
 
@@ -337,7 +361,8 @@ interface PlanContext {
 
 const planContext = (config: Config, toolchains: Record<string, string>, env: Readonly<Record<string, string | undefined>>): PlanContext => {
   const names = [...(config.env ?? []), ...config.suites.flatMap((s) => s.env ?? []), ...(config.commands ?? []).flatMap((c) => c.env ?? [])];
-  return { toolchains, env: Object.fromEntries(keyedEnv(env, names)) };
+  const hashed = config.suites.flatMap((s) => s.hashedEnv ?? []);
+  return { toolchains, env: Object.fromEntries([...keyedEnv(env, names), ...hashedEnv(env, hashed)]) };
 };
 
 /** Pure: the names (never the values: a keyed variable may be private) of what differs between two contexts. */
@@ -498,7 +523,8 @@ const runBatch = (
       catch: () => new FileFailed({ message: "no temporary folder" }),
     });
     const timeoutMs = deadlineMs(batch, suite.timeoutMs);
-    const env = { ...unitEnv(context.env, [...(context.config.env ?? []), ...(suite.env ?? [])], tmp), ...prepared.env };
+    const allowed = unitEnv(context.env, [...(context.config.env ?? []), ...(suite.env ?? []), ...(suite.hashedEnv ?? [])], tmp);
+    const env = { ...(suite.inheritEnv ? withoutUndefined(context.env) : {}), ...allowed, ...prepared.env };
     // Admission by memory: a batch takes its suite's share of the budget at once, never part of it.
     const exited = yield* Semaphore.withPermits(
       memory,
@@ -543,8 +569,13 @@ export const test = (options: TestOptions) =>
         );
       }
     } else mine = share(prepared.misses, prepared.audits, count)[index - 1] ?? [];
-    const slots = options.slots ?? Math.max(1, availableParallelism());
-    const plan = batches(mine.map(toTimed), { slots, startupMs: 500, minBatchMs: 4000 }).map((b): Batch => ({
+    // An e2e run is one CLI at a time: its config's workers run its tests in parallel, and two would
+    // start the config's app twice on one port, or share one simulator.
+    const e2eOnly = config.suites.length > 0 && config.suites.every((s) => s.adapter === "e2e");
+    const slots = options.slots ?? (e2eOnly ? 1 : Math.max(1, availableParallelism()));
+    // An e2e suite's share is one batch: one CLI start (its app, its browser or simulator) for all of
+    // it, its own workers spread across its tests.
+    const plan = (e2eOnly ? oneBatchPerSuite(mine) : batches(mine.map(toTimed), { slots, startupMs: 500, minBatchMs: 4000 })).map((b): Batch => ({
       suite: b.suite,
       expectedMs: b.expectedMs,
       units: b.units.map((x) => x.unit),
@@ -598,7 +629,9 @@ export const test = (options: TestOptions) =>
           first.set(u.id, { unit: u, status: r ? (r.passed ? "passed" : "failed") : "unfinished", result: r, output: r?.passed ? undefined : exited.output });
         }
       const red = [...first.values()].filter((o) => o.status !== "passed");
-      const retried = [...red.filter((o) => o.status === "unfinished"), ...red.filter((o) => o.status === "failed").slice(0, MAX_RETRIES)];
+      // A suite that retries on its own (an e2e config's `retries`) is not run again here.
+      const again = red.filter((o) => o.unit.suite.rerunAlone !== false);
+      const retried = [...again.filter((o) => o.status === "unfinished"), ...again.filter((o) => o.status === "failed").slice(0, MAX_RETRIES)];
       if (retried.length > 0) {
         yield* Console.error(`outrun: ${retried.length} red or unfinished units run again alone`);
         const alone = yield* Effect.forEach(

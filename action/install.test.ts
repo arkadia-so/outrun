@@ -66,5 +66,9 @@ describe("the GitHub Action", () => {
     const pkg = JSON.parse(readFileSync(join(oss, "package.json"), "utf8")) as { version: string };
     const outrun = Bun.spawnSync([join(bin, "outrun"), "--version"]);
     expect(outrun.stdout.toString().trim()).toBe(`outrun v${pkg.version}`);
-  });
+    // Real work, not a hang: `bun install` from Bun's install cache (HOME's, 0.3-0.7 s) and two cold
+    // starts of the CLI's sources (`outrun --version`, 1.2-4 s each under load). Measured 3.7-5.6 s
+    // alone on a laptop at load average 115-250 (2026-11-07), 7.8 s in CI run 42262946102, past
+    // vitest's 5 s default.
+  }, 30_000);
 });
