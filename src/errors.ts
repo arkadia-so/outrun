@@ -13,7 +13,11 @@ export class SpawnFailed extends Schema.TaggedError<SpawnFailed>()("SpawnFailed"
 export class FileFailed extends Schema.TaggedError<FileFailed>()("FileFailed", { message: Schema.String }) {}
 
 /** The remote verdict cache did not answer as expected. */
-export class CacheUnavailable extends Schema.TaggedError<CacheUnavailable>()("CacheUnavailable", { message: Schema.String }) {}
+export class CacheUnavailable extends Schema.TaggedError<CacheUnavailable>()("CacheUnavailable", {
+  message: Schema.String,
+  /** The HTTP status of an answer that was not the expected one, when there was an answer. */
+  status: Schema.optional(Schema.Number),
+}) {}
 
 /** The command line asks for something invalid (a shard out of range...). */
 export class UsageInvalid extends Schema.TaggedError<UsageInvalid>()("UsageInvalid", { message: Schema.String }) {}

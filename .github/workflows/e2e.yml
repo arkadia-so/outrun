@@ -4,6 +4,18 @@ name: outrun e2e
 # key already passed is replayed, the others are spread over as many runners as the wall time aims for,
 # by the durations outrun learned, and their JUnit reports are merged into one.
 #
+# The plan job installs nothing when every config was already listed with the same inputs (a kept
+# listing, in outrun's cache): it plans, and only the shards install. An app the tests drive on a
+# device (an iOS simulator `.app`) is built once per run by `build`, cached in the fleet's tiers by
+# its inputs' content, and installed on a simulator each macOS shard boots:
+#
+#       with:
+#         runs-on: outrun-macos
+#         install: npm ci
+#         build: ./scripts/build-simulator-app.sh
+#         build-inputs: ios/** package-lock.json
+#         app: build/Acme.app
+#
 #   jobs:
 #     e2e:
 #       uses: arkadia-so/outrun/.github/workflows/e2e.yml@v1
@@ -36,6 +48,22 @@ on:
         description: What the tests need beyond the dependencies (a browser, an app built for the simulator); run jobs only
         type: string
         default: ""
+      build:
+        description: Builds the app the tests drive once per run, after `install` (an iOS simulator .app); skipped when its inputs' build is cached or nothing runs
+        type: string
+        default: ""
+      build-inputs:
+        description: Globs of the files the build reads, from the repository's root, separated by spaces (`!glob` excludes); its cache key with the command and the runner's image
+        type: string
+        default: "**"
+      app:
+        description: What the build makes (a file or folder, from the repository's root), given to every shard at the same path; an iOS .app is installed on a booted simulator
+        type: string
+        default: ""
+      simulator:
+        description: On macOS, with an iOS .app, the simulator a shard boots when none is booted, by name (the newest runtime's first match)
+        type: string
+        default: iPhone
       env:
         description: Variables for the tests, one NAME=value per line (not secret; outrun keys the tests on them)
         type: string
@@ -73,18 +101,16 @@ jobs:
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 15
     outputs:
-      runners: ${{ steps.plan.outputs.runners }}
-      matrix: ${{ steps.plan.outputs.matrix }}
+      runners: ${{ steps.plan.outputs.runners || steps.listed.outputs.runners }}
+      matrix: ${{ steps.plan.outputs.matrix || steps.listed.outputs.matrix }}
+      app-key: ${{ steps.app.outputs.key }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: arkadia-so/outrun@v1
+      - uses: arkadia-so/outrun@v1.2.0 # this release's own action: package.json's version (release.test.ts)
+      # Before planning, even with no install: Node's version is in the tests' keys.
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: ${{ inputs.node-version }}
-      - if: inputs.bun-version != ''
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: ${{ inputs.bun-version }}
       - name: Environment
         shell: bash
         env:
@@ -92,10 +118,40 @@ jobs:
           NAMES: ${{ inputs.env-secrets }}
           SECRETS: ${{ toJSON(secrets) }}
         run: outrun e2e-env >>"$GITHUB_ENV"
-      - name: Install
+      - id: app
+        if: inputs.build != ''
+        name: App key
+        shell: bash
+        env:
+          BUILD: ${{ inputs.build }}
+          INPUTS: ${{ inputs.build-inputs }}
+        run: |
+          set -f
+          globs=()
+          for glob in $INPUTS; do globs+=(--inputs "$glob"); done
+          key=$(outrun e2e-app-key --build "$BUILD" "${globs[@]}")
+          echo "OUTRUN_E2E_APP=$key" >>"$GITHUB_ENV"
+      # Every config already listed with these inputs: planned with no install.
+      - id: plan
+        name: Plan (kept listings)
+        shell: bash
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          only=()
+          for path in $ONLY; do only+=(--only "$path"); done
+          outrun plan --e2e --cached-listings --out "$RUNNER_TEMP/plan.json" --max-runners ${{ inputs.max-runners }} --target ${{ inputs.target }} "${only[@]}"
+      - if: steps.plan.outputs.planned == 'false' && inputs.bun-version != ''
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ inputs.bun-version }}
+      - if: steps.plan.outputs.planned == 'false'
+        name: Install
         shell: bash
         run: ${{ inputs.install }}
-      - id: plan
+      - id: listed
+        if: steps.plan.outputs.planned == 'false'
+        name: Plan (listed by e2e)
         shell: bash
         env:
           ONLY: ${{ inputs.only }}
@@ -109,9 +165,83 @@ jobs:
           path: ${{ runner.temp }}/plan.json
           retention-days: 1
 
-  run:
+  # The app, once per run: from the fleet's cache tiers when its key was built before, else built
+  # here and saved into this job's tier; given to the shards as an artifact (a shard on another
+  # machine has no copy of the tier).
+  build:
     needs: plan
-    if: needs.plan.outputs.runners != '0'
+    if: inputs.build != '' && needs.plan.outputs.runners != '0'
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      KEY: ${{ needs.plan.outputs.app-key }}
+      APP: ${{ inputs.app }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: cached
+        name: Cached app
+        shell: bash
+        run: |
+          entry="e2e-app-$KEY.tar"
+          for tier in "${OUTRUN_CACHE:-}" "${OUTRUN_CACHE_PROTECTED:-}"; do
+            if [ -n "$tier" ] && [ -f "$tier/$entry" ]; then
+              echo "outrun e2e: the app $KEY is cached ($tier)"
+              cp "$tier/$entry" "$RUNNER_TEMP/app.tar"
+              if [ "$tier" = "${OUTRUN_CACHE_PROTECTED:-}" ] && [ -n "${OUTRUN_CACHE:-}" ]; then
+                mkdir -p "$OUTRUN_CACHE/.outrun-used" && touch "$OUTRUN_CACHE/.outrun-used/$entry"
+              fi
+              echo "hit=true" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "hit=false" >>"$GITHUB_OUTPUT"
+      - if: steps.cached.outputs.hit != 'true'
+        uses: arkadia-so/outrun@v1.2.0 # this release's own action: package.json's version (release.test.ts)
+      - if: steps.cached.outputs.hit != 'true'
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - if: steps.cached.outputs.hit != 'true' && inputs.bun-version != ''
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ inputs.bun-version }}
+      - if: steps.cached.outputs.hit != 'true'
+        name: Environment
+        shell: bash
+        env:
+          VARIABLES: ${{ inputs.env }}
+          NAMES: ${{ inputs.env-secrets }}
+          SECRETS: ${{ toJSON(secrets) }}
+        run: outrun e2e-env >>"$GITHUB_ENV"
+      - if: steps.cached.outputs.hit != 'true'
+        name: Install
+        shell: bash
+        run: ${{ inputs.install }}
+      - if: steps.cached.outputs.hit != 'true'
+        name: Build
+        shell: bash
+        run: ${{ inputs.build }}
+      - if: steps.cached.outputs.hit != 'true'
+        name: Save
+        shell: bash
+        run: |
+          [ -e "$APP" ] || { echo "outrun e2e: the build made no $APP (the app input)" >&2; exit 1; }
+          tar -C "$(dirname "$APP")" -cf "$RUNNER_TEMP/app.tar" "$(basename "$APP")"
+          if [ -n "${OUTRUN_CACHE:-}" ]; then
+            entry="e2e-app-$KEY.tar"
+            cp "$RUNNER_TEMP/app.tar" "$OUTRUN_CACHE/.$entry.tmp" && mv "$OUTRUN_CACHE/.$entry.tmp" "$OUTRUN_CACHE/$entry"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: outrun-e2e-app
+          path: ${{ runner.temp }}/app.tar
+          retention-days: 1
+          compression-level: 0
+
+  run:
+    needs: [plan, build]
+    # The build job skipped means no build input (or nothing to run): the shards need no app.
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.runners != '0' && (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     strategy:
@@ -120,7 +250,7 @@ jobs:
         shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: arkadia-so/outrun@v1
+      - uses: arkadia-so/outrun@v1.2.0 # this release's own action: package.json's version (release.test.ts)
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: ${{ inputs.node-version }}
@@ -146,6 +276,52 @@ jobs:
         with:
           name: outrun-e2e-plan
           path: ${{ runner.temp }}/plan
+      - id: app
+        if: inputs.build != ''
+        name: Cached app
+        shell: bash
+        env:
+          KEY: ${{ needs.plan.outputs.app-key }}
+        run: |
+          echo "OUTRUN_E2E_APP=$KEY" >>"$GITHUB_ENV"
+          entry="e2e-app-$KEY.tar"
+          for tier in "${OUTRUN_CACHE:-}" "${OUTRUN_CACHE_PROTECTED:-}"; do
+            if [ -n "$tier" ] && [ -f "$tier/$entry" ]; then
+              mkdir -p "$RUNNER_TEMP/app" && cp "$tier/$entry" "$RUNNER_TEMP/app/app.tar"
+              echo "hit=true" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "hit=false" >>"$GITHUB_OUTPUT"
+      - if: inputs.build != '' && steps.app.outputs.hit != 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: outrun-e2e-app
+          path: ${{ runner.temp }}/app
+      - if: inputs.build != ''
+        name: App
+        shell: bash
+        env:
+          APP: ${{ inputs.app }}
+          SIMULATOR: ${{ inputs.simulator }}
+        run: |
+          mkdir -p "$(dirname "$APP")"
+          rm -rf "$APP"
+          tar -C "$(dirname "$APP")" -xf "$RUNNER_TEMP/app/app.tar"
+          [ "$RUNNER_OS" = macOS ] && [[ "$APP" == *.app ]] || exit 0
+          # The booted iOS simulators (e2e's mobile driver uses those), else the newest runtime's first
+          # device named like SIMULATOR, booted: the app is installed on each.
+          booted=$(xcrun simctl list devices booted -j | jq -r '.devices | to_entries[] | select(.key | test("iOS")) | .value[].udid')
+          if [ -z "$booted" ]; then
+            booted=$(xcrun simctl list devices available -j | jq -r --arg name "$SIMULATOR" '[.devices | to_entries[] | select(.key | test("iOS"))] | sort_by(.key | capture("iOS-(?<v>[0-9-]+)").v | split("-") | map(tonumber)) | reverse | map(.value[] | select(.name | contains($name))) | first | .udid // empty')
+            [ -n "$booted" ] || { echo "outrun e2e: no iOS simulator named like '$SIMULATOR' on this runner" >&2; exit 1; }
+            xcrun simctl boot "$booted"
+          fi
+          for udid in $booted; do
+            xcrun simctl bootstatus "$udid" -b >/dev/null
+            xcrun simctl install "$udid" "$APP"
+            echo "outrun e2e: $APP installed on simulator $udid"
+          done
       - name: e2e
         shell: bash
         env:
@@ -168,7 +344,7 @@ jobs:
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 10
     steps:
-      - uses: arkadia-so/outrun@v1
+      - uses: arkadia-so/outrun@v1.2.0 # this release's own action: package.json's version (release.test.ts)
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: outrun-e2e-[0-9]*

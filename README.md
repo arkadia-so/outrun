@@ -183,6 +183,18 @@ test. A pass replays for 24 hours, since the app may change without a commit. Th
 job's whole environment, and a red file is not run again alone (the config's `retries` decide).
 `--only <path>` keeps the configs whose folder holds or lies under the path.
 
+A config's listing is kept (on the machine and in the remote cache) under the key of what can
+change it: its folder's paths, the content of its test files (named `*.e2e.*`, `*.test.*`,
+`*.spec.*`, or under an `e2e/` or `test(s)/` folder), its import closure, the lockfiles and the
+variables the folder reads. `outrun plan --e2e --cached-listings` plans from kept listings alone,
+without e2e's CLI or the repository's dependencies, and writes `planned=false` to `$GITHUB_OUTPUT`
+(and no plan) when a config has none, so a job installs and plans again only then.
+
+An app the tests drive on a device (an iOS simulator `.app`) is built once per run. `outrun
+e2e-app-key --build <cmd> --inputs <glob>...` is its key: the command, the machine (OS, release,
+image) and the content of the files the globs match. Set as `OUTRUN_E2E_APP`, it is in every
+discovered unit's key, so a new build reruns the tests and an unchanged one replays them.
+
 In GitHub Actions, the reusable workflow plans, fans out and merges the reports:
 
 ```yaml
@@ -198,6 +210,25 @@ jobs:
       env-secrets: ACME_MODEL_TOKEN        # secrets the tests read, by name
     secrets: inherit
 ```
+
+The plan job installs nothing when every config's listing is kept. On `outrun-macos`, the app is
+built once and each shard installs it on a simulator:
+
+```yaml
+    with:
+      runs-on: outrun-macos
+      install: npm ci
+      build: ./scripts/build-simulator-app.sh   # once per run, after install
+      build-inputs: ios/** package-lock.json    # its key, with the command and the image
+      app: build/Acme.app                       # given to each shard at this path
+      simulator: iPhone                         # booted when none is (the newest runtime's)
+```
+
+The build job takes the app from the fleet's cache tiers when its key was built before (`$OUTRUN_CACHE`,
+then `$OUTRUN_CACHE_PROTECTED`, written by the default branch's runs), else builds it and saves it into
+the job's tier; the shards get it from the tier or as the run's artifact. A shard installs an iOS
+`.app` on every booted simulator, so a config that names no `device` runs on it. The build is
+skipped, with the matrix, when every test replays.
 
 The repository needs `e2e` in its dependencies, Node on the runner, `.e2e/` git-ignored (outrun
 writes each batch's report under `.e2e/outrun-*`, inside the project root as the CLI requires), and

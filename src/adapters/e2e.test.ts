@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { e2eResults, withJunit } from "./e2e.ts";
+import { e2eResults, withCli, withJunit } from "./e2e.ts";
 
 const report = (suites: string) => `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites name="e2e">\n${suites}\n</testsuites>\n`;
 
@@ -44,5 +44,17 @@ describe("the e2e adapter", () => {
       "--config",
       "e2e.config.ts",
     ]);
+  });
+
+  it("runs a discovered suite's `e2e` on the CLI installed nearest its config, under Node", () => {
+    expect(withCli(["e2e", "run", "--config", "e2e.config.ts"], "../node_modules/e2e/dist/cli/bin.js")).toEqual([
+      "node",
+      "../node_modules/e2e/dist/cli/bin.js",
+      "run",
+      "--config",
+      "e2e.config.ts",
+    ]);
+    expect(withCli(["npx", "e2e", "run"], "x.js")).toEqual(["npx", "e2e", "run"]);
+    expect(withCli(["e2e", "run"], undefined)).toEqual(["e2e", "run"]);
   });
 });

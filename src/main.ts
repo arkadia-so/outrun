@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { appendFile } from "node:fs/promises";
 // The outrun command.
 //
 //   outrun plan --out plan.json [--max-runners n] [--target s] [--start s] [--slots n]
@@ -11,6 +12,7 @@
 //                                the command unit's step passed: write its pass
 //   outrun units [--json]        every unit, its key and how many files its key holds
 //   --e2e (plan, test, units)    no outrun.json: the checkout's TesterArmy e2e configs are the suites
+//   outrun e2e-app-key --build <cmd> --inputs <glob>...   the key of an app the e2e workflow builds once
 //   outrun junit-merge --out f <reports...>
 //                                one JUnit report from several (a run's shards)
 //   outrun xcode-reads --trace-dir d --build unit [--run unit]... --out file
@@ -30,10 +32,13 @@ import { Argument, CliError, Command, Flag } from "effect/cli";
 import pkg from "../package.json" with { type: "json" };
 import { BAZEL, buildCacheApp, NX } from "./build-cache.ts";
 import { githubOidc } from "./cache.ts";
+import { appKey } from "./discover.ts";
 import { e2eEnvLines } from "./e2e-env.ts";
-import { blocking, keyUnits, lookupCommand, plan, recordCommand, test } from "./engine.ts";
+import { blocking, keyUnits, lookupCommand, plan, planCached, recordCommand, test } from "./engine.ts";
 import { CacheUnavailable, FileFailed, TestsFailed, UsageInvalid } from "./errors.ts";
+import * as Git from "./git.ts";
 import { mergeJunit, parseJunit } from "./junit.ts";
+import { machineFingerprint } from "./machine.ts";
 import type { Remote } from "./upstream.ts";
 import { xcodeReads } from "./xcode-reads.ts";
 
@@ -131,10 +136,14 @@ const planCommand = Command.make(
     audit,
     only,
     e2e,
+    cachedListings: Flag.Boolean("cached-listings").pipe(
+      Flag.withDescription("with --e2e: never run e2e's CLI; with a config never listed with these inputs, write planned=false and no plan"),
+      Flag.withDefault(false),
+    ),
   },
   (flags) =>
     Effect.gen(function* () {
-      yield* plan({
+      yield* (flags.cachedListings ? planCached : plan)({
         cwd: process.cwd(),
         config: Option.getOrUndefined(flags.config),
         remote: yield* remoteOf(flags.local),
@@ -326,6 +335,29 @@ const e2eEnvCommand = Command.make("e2e-env", {}, () =>
   ),
 );
 
+const e2eAppKeyCommand = Command.make(
+  "e2e-app-key",
+  {
+    build: Flag.String("build").pipe(Flag.withDescription("the command that builds the app")),
+    inputs: Flag.String("inputs").pipe(
+      Flag.withDescription("a glob of the files the build reads, from the root; `!glob` excludes (repeatable)"),
+      Flag.atLeast(1),
+    ),
+  },
+  (flags) =>
+    Effect.gen(function* () {
+      const repo = yield* Git.root(process.cwd());
+      const blobs = yield* Git.blobs(repo);
+      const key = appKey(blobs, flags.build, flags.inputs, machineFingerprint(env, []));
+      const output = env.GITHUB_OUTPUT;
+      if (output)
+        yield* Effect.tryPromise({ try: () => appendFile(output, `key=${key}\n`), catch: () => new FileFailed({ message: `${output}: not writable` }) });
+      yield* Console.log(key);
+    }),
+).pipe(
+  Command.withDescription("The key of an app built once per e2e run (its build command, the machine, its inputs' content): the cache's key and OUTRUN_E2E_APP"),
+);
+
 const outrun = Command.make("outrun").pipe(
   Command.withDescription("outrun's CI engine: test files as units, keyed by content, verdicts cached, misses batched and balanced across runners"),
   Command.withSubcommands([
@@ -339,6 +371,7 @@ const outrun = Command.make("outrun").pipe(
     bazelCacheCommand,
     junitMergeCommand,
     e2eEnvCommand,
+    e2eAppKeyCommand,
   ]),
 );
 

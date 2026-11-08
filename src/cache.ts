@@ -16,7 +16,7 @@
 // Durations are one artifact per unit rather than one record per package: shards of a run write
 // them at once, and per-unit artifacts need no merge (a lost merge would only cost balance).
 import { mkdir } from "node:fs/promises";
-import { Effect } from "effect";
+import { Effect, Schedule } from "effect";
 import { CacheUnavailable, FileFailed } from "./errors.ts";
 import { type Remote, request, UPSTREAM_CONCURRENCY } from "./upstream.ts";
 
@@ -107,7 +107,22 @@ export const get = (remote: Remote, hash: string, timeoutMs?: number) =>
     ),
   );
 
-/** Stores artifacts; returns how many the server refused (reported, not fatal: a cache). */
+/** Pure: an answer worth asking again: the server or its storage was busy or briefly unreachable, not a refusal. */
+const transient = (status: number) => status === 429 || status >= 500;
+
+export interface Refused {
+  /** How many writes the server did not take. */
+  readonly count: number;
+  /** Their last answers' statuses, "503 ×2" ("unreachable" for no answer), for the log line that reports them. */
+  readonly statuses: string;
+}
+
+/**
+ * Stores artifacts; returns what the server refused (reported, not fatal: a cache). A transient answer
+ * (a 503 when the cache could not decide the caller's access in time, a 429 from the store) is asked
+ * again with a backoff, as a failed connection is: on the cold run 42526792932 (OUT-45) 2 of 6 writes
+ * came back non-ok once and were counted as refused, never retried.
+ */
 export const put = (remote: Remote, puts: readonly Put[]) =>
   Effect.forEach(
     puts,
@@ -122,11 +137,26 @@ export const put = (remote: Remote, puts: readonly Put[]) =>
           "x-artifact-tag": p.tag,
         },
       }).pipe(
-        Effect.retry({ times: 2 }),
-        Effect.map((response) => (response.ok ? 0 : 1)),
+        Effect.flatMap((response) =>
+          transient(response.status)
+            ? Effect.fail(new CacheUnavailable({ message: `PUT answered ${response.status}`, status: response.status }))
+            : Effect.succeed(response),
+        ),
+        Effect.retry({ times: 3, schedule: Schedule.exponential("250 millis") }),
+        Effect.map((response) => (response.ok ? undefined : String(response.status))),
+        Effect.catchTag("CacheUnavailable", (e) => Effect.succeed(e.status === undefined ? "unreachable" : String(e.status))),
       ),
     { concurrency: UPSTREAM_CONCURRENCY },
-  ).pipe(Effect.map((refused) => refused.reduce<number>((a, b) => a + b, 0)));
+  ).pipe(
+    Effect.map((answers): Refused => {
+      const counts = new Map<string, number>();
+      for (const a of answers) if (a !== undefined) counts.set(a, (counts.get(a) ?? 0) + 1);
+      return {
+        count: [...counts.values()].reduce((a, b) => a + b, 0),
+        statuses: [...counts].map(([s, n]) => (n > 1 ? `${s} ×${n}` : s)).join(", "),
+      };
+    }),
+  );
 
 /** A GitHub Actions job's OIDC token for the cache's audience (needs `permissions: id-token: write`). */
 export const githubOidc = (audience: string, env: Readonly<Record<string, string | undefined>>) =>

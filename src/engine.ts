@@ -71,6 +71,8 @@ export interface KeyOptions {
   readonly e2e?: boolean | undefined;
   /** Only the units under these paths; with `e2e`, only the configs whose folder overlaps them. */
   readonly only?: readonly string[] | undefined;
+  /** With `e2e`: never run e2e's CLI, only use the kept listings (discover.ts; the plan before an install). */
+  readonly cachedListings?: boolean | undefined;
 }
 
 export interface PlanOptions extends KeyOptions {
@@ -142,15 +144,11 @@ export const keyUnits = (options: KeyOptions) =>
   Effect.gen(function* () {
     const t0 = now();
     const repo = yield* Git.root(options.cwd);
-    const [config, blobs] = options.e2e
-      ? yield* Git.blobs(repo).pipe(
-          Effect.map((all) => withoutOwn(all, repo, options.cwd, options.own ?? [])),
-          Effect.flatMap((blobs) => discoverE2e(repo, blobs, options.env, options.only).pipe(Effect.map((config) => [config, blobs] as const))),
-        )
+    const [loaded, blobs] = options.e2e
+      ? [undefined, withoutOwn(yield* Git.blobs(repo), repo, options.cwd, options.own ?? [])]
       : yield* Effect.all([loadConfig(options.config ?? `${repo}/outrun.json`), Git.blobs(repo)], { concurrency: 2 }).pipe(
           Effect.map(([config, all]) => [config, withoutOwn(all, repo, options.cwd, options.own ?? [])] as const),
         );
-    const tIndex = now();
     const state = stateDir(options.env);
     // An unreadable scan cache is rebuilt: it only saves reading files again.
     const scans = yield* loadScans(state).pipe(Effect.catchTag("FileFailed", () => Effect.succeed(new Map<string, readonly string[] | null>())));
@@ -175,6 +173,11 @@ export const keyUnits = (options: KeyOptions) =>
       },
       read,
     );
+    const discovered = loaded
+      ? { config: loaded, missing: [] as string[] }
+      : yield* discoverE2e(repo, blobs, options.env, { graph, state, remote: options.remote, cachedOnly: options.cachedListings }, options.only);
+    const config = discovered.config;
+    const tIndex = now();
     const machine = machineFingerprint(options.env, config.system ?? []);
     const adapters = [...new Set(config.suites.map((s) => s.adapter))];
     const toolchains: Record<string, string> = Object.fromEntries(
@@ -196,6 +199,8 @@ export const keyUnits = (options: KeyOptions) =>
     return {
       repo,
       config,
+      /** With `cachedListings`, the e2e configs whose listing is not kept (their units are not keyed). */
+      missingListings: discovered.missing,
       blobs,
       units,
       commands,
@@ -300,9 +305,11 @@ const filterOnly = (units: readonly Unit[], only: readonly string[] | undefined)
   only ? units.filter((u) => only.some((o) => u.id === o || u.id.startsWith(`${o.replace(/\/$/, "")}/`))) : units;
 
 /** Keys, lookups, and what is left to run: the misses, and the audits picked among the hits. */
-const prepare = (options: PlanOptions) =>
+type Keyed = Effect.Success<ReturnType<typeof keyUnits>>;
+
+const prepare = (options: PlanOptions, given?: Keyed) =>
   Effect.gen(function* () {
-    const keyed = yield* keyUnits(options);
+    const keyed = given ?? (yield* keyUnits(options));
     const tier = tierOf(options.env, keyed.config.trustedRef ?? "refs/heads/main", hostname());
     const units = filterOnly(keyed.units, options.only);
     const local = new LocalCache(`${keyed.state}/verdicts`);
@@ -375,7 +382,7 @@ export const contextDiff = (plan: PlanContext | undefined, here: PlanContext): s
   return out;
 };
 
-export interface PlanRunners {
+interface PlanRunners {
   readonly max: number;
   readonly targetMs: number;
   readonly startMs: number;
@@ -387,9 +394,32 @@ export interface PlanRunners {
  * `outrun plan`: the lookups, done once before any test job: how many runners the misses need
  * (none when every unit hits, so no job starts), and which runner runs which unit.
  */
-export const plan = (options: PlanOptions & { readonly runners: PlanRunners; readonly out: string }) =>
+type PlanCallOptions = PlanOptions & { readonly runners: PlanRunners; readonly out: string };
+
+/** `outrun plan` with the kept listings only (`--cached-listings`): undefined when a config has none. */
+export const planCached = (options: PlanCallOptions) => planOrMissing({ ...options, cachedListings: true });
+
+export const plan = (options: Omit<PlanCallOptions, "cachedListings">) =>
+  planOrMissing({ ...options, cachedListings: false }).pipe(
+    // Without cachedListings, every config is listed by its CLI: no listing is ever missing.
+    Effect.flatMap((file) => (file ? Effect.succeed(file) : Effect.die(new Error("a plan without --cached-listings missed a listing")))),
+  );
+
+const planOrMissing = (options: PlanCallOptions) =>
   Effect.gen(function* () {
-    const prepared = yield* prepare({ ...options, own: [options.out] });
+    const keyed = yield* keyUnits({ ...options, own: [options.out] });
+    const output = options.env.GITHUB_OUTPUT;
+    if (keyed.missingListings.length > 0) {
+      // --cached-listings: a config was never listed with these inputs; the job installs, then plans.
+      yield* Console.error(`outrun: no kept listing for ${keyed.missingListings.join(", ")}: plan again once e2e's CLI is installed`);
+      if (output)
+        yield* Effect.tryPromise({
+          try: () => appendFile(output, "planned=false\n"),
+          catch: () => new FileFailed({ message: `${output}: not writable` }),
+        });
+      return undefined;
+    }
+    const prepared = yield* prepare({ ...options, own: [options.out] }, keyed);
     const runners = runnersFor(prepared.misses.map(toTimed), options.runners);
     const shares = runners === 0 ? [] : share(prepared.misses, prepared.audits, runners);
     const file: PlanFile = {
@@ -417,13 +447,12 @@ export const plan = (options: PlanOptions & { readonly runners: PlanRunners; rea
         .map(([k, v]) => `${k} ${Math.round(v)} ms`)
         .join(", ")})`,
     );
-    const output = options.env.GITHUB_OUTPUT;
     if (output)
       yield* Effect.tryPromise({
         try: () =>
           appendFile(
             output,
-            `runners=${runners}\nmatrix=${JSON.stringify(Array.from({ length: runners }, (_, i) => i + 1))}\nmisses=${prepared.misses.length}\n${commandOutputs(file.commands)}keys=${JSON.stringify(file.commandKeys)}\n`,
+            `planned=true\nrunners=${runners}\nmatrix=${JSON.stringify(Array.from({ length: runners }, (_, i) => i + 1))}\nmisses=${prepared.misses.length}\n${commandOutputs(file.commands)}keys=${JSON.stringify(file.commandKeys)}\n`,
           ),
         catch: () => new FileFailed({ message: `${output}: not writable` }),
       });
@@ -811,8 +840,8 @@ const record = (
     const remote = options.remote && options.write ? options.remote : undefined;
     if (remote) {
       // A write the cache refuses or misses costs a later run a miss, never a wrong verdict.
-      const refused = yield* put(remote, puts).pipe(Effect.catchTag("CacheUnavailable", () => Effect.succeed(puts.length)));
-      if (refused > 0) yield* Console.error(`outrun: the remote cache refused ${refused} of ${puts.length} writes`);
+      const refused = yield* put(remote, puts);
+      if (refused.count > 0) yield* Console.error(`outrun: the remote cache refused ${refused.count} of ${puts.length} writes (${refused.statuses})`);
     }
     if (readSets.size > 0) yield* saveReadSets(keyed.state, readSets, remote);
   });
@@ -900,10 +929,8 @@ export const recordCommand = (
       .set(new Map([[command.key, { durationMs: options.durationMs, tag }]]))
       .pipe(Effect.catchTag("FileFailed", (e) => Console.error(`outrun: ${e.message}`)));
     if (options.remote && options.write) {
-      const refused = yield* put(options.remote, [{ hash: command.key, body: JSON.stringify(verdict), durationMs: options.durationMs, tag }]).pipe(
-        Effect.catchTag("CacheUnavailable", () => Effect.succeed(1)),
-      );
-      if (refused > 0) yield* Console.error(`outrun: the remote cache refused the command's ${verdict.outcome}`);
+      const refused = yield* put(options.remote, [{ hash: command.key, body: JSON.stringify(verdict), durationMs: options.durationMs, tag }]);
+      if (refused.count > 0) yield* Console.error(`outrun: the remote cache refused the command's ${verdict.outcome} (${refused.statuses})`);
     }
     yield* Console.error(
       `outrun: ${command.name} ${options.failed ? "failed (quarantined, recorded)" : "passed"} (${command.inputs === undefined ? "the given key" : `${command.inputs} inputs`}, tier ${tier})`,

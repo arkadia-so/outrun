@@ -5,6 +5,7 @@
 // output outside the project root; `.e2e/` is the folder its own runs write and ignore). The CLI's
 // own version comes from the lockfile, which the discovered suites key (discover.ts).
 import { Effect } from "effect";
+import { nearestCli } from "../discover.ts";
 import { FileFailed, SpawnFailed } from "../errors.ts";
 import { parseJunit } from "../junit.ts";
 import type { Adapter, UnitResult } from "./adapter.ts";
@@ -33,6 +34,13 @@ export const withJunit = (run: readonly string[]): string[] => {
   return [...run.slice(0, at + 1), [...new Set([...reporters, "junit"])].join(","), ...run.slice(at + 2)];
 };
 
+/**
+ * Pure: the argv of a discovered suite's run, its `e2e` the CLI installed nearest to the config (under
+ * Node), given its path relative to the config's folder; any other run is the suite's own.
+ */
+export const withCli = (run: readonly string[], cli: string | undefined): string[] =>
+  run[0] === "e2e" && cli !== undefined ? ["node", cli, ...run.slice(1)] : [...run];
+
 export const e2eAdapter: Adapter = {
   name: "e2e",
   toolchain: (env) =>
@@ -54,7 +62,7 @@ export const e2eAdapter: Adapter = {
     const report = `${cwd}/${output}/junit.xml`;
     return {
       // The suite's run names its progress reporter (list); junit is added for the per-file results.
-      argv: [...withJunit(suite.run), "--output", output, ...files],
+      argv: [...withJunit(withCli(suite.run, nearestCli(repo, suite.dir))), "--output", output, ...files],
       cwd,
       results: (exit) =>
         Effect.tryPromise({

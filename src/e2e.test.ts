@@ -2,11 +2,11 @@
 // run, replayed, and rerun when the variable naming its app changes. The CLI is a stand-in with
 // e2e's interface (`list --reporter json`, `run --reporter …,junit --output <dir> <files>`), and
 // `node` a shim onto Bun, so the test needs neither Node nor the real CLI.
-import { chmod, mkdtemp } from "node:fs/promises";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect } from "effect";
-import { plan, test as outrunTest, type TestOptions } from "./engine.ts";
+import { plan, planCached, test as outrunTest, type TestOptions } from "./engine.ts";
 import { FileFailed } from "./errors.ts";
 
 const io = <A>(f: () => Promise<A>) => Effect.tryPromise({ try: f, catch: (e) => new FileFailed({ message: String(e) }) });
@@ -123,6 +123,45 @@ describe("outrun test --e2e", () => {
         const out = `${s.state}/plan.json`;
         const planned = yield* plan({ ...options(s, "p1"), out, runners: { max: 16, targetMs: 300_000, startMs: 60_000, slots: 1 } });
         expect(planned.units.map((u) => u.id)).toEqual(["web/e2e/cart.e2e.ts", "web/e2e/home.e2e.ts"]);
+      }),
+    60_000,
+  );
+
+  it.effect(
+    "plans with no install once the config was listed with these inputs, and its shards' keys are the plan's",
+    () =>
+      Effect.gen(function* () {
+        const s = yield* setup();
+        const out = `${s.state}/plan.json`;
+        const runners = { max: 16, targetMs: 300_000, startMs: 60_000, slots: 1 };
+        // Never listed: no plan without the CLI.
+        expect(yield* planCached({ ...options(s, "c1"), out, runners })).toBeUndefined();
+        const listed = yield* plan({ ...options(s, "c2"), out, runners });
+        // The CLI gone (the plan job before its install): the kept listing plans the same units, same keys.
+        yield* io(() => rm(`${s.dir}/node_modules`, { recursive: true }));
+        const cached = yield* planCached({ ...options(s, "c3"), out, runners });
+        expect(cached?.units).toEqual(listed.units);
+        // An edit of the app is no new listing (its tests rerun, from the plan's keys).
+        yield* io(() => Bun.write(`${s.dir}/web/src/app.ts`, "export const app = 3;\n"));
+        const edited = yield* planCached({ ...options(s, "c3b"), out, runners });
+        expect(edited?.units.map((u) => u.id)).toEqual(listed.units.map((u) => u.id));
+        expect(edited?.units[0]?.key).not.toBe(listed.units[0]?.key);
+        // A new test file is a new listing: none is kept for it.
+        yield* io(() => Bun.write(`${s.dir}/web/e2e/search.e2e.ts`, "// search\n"));
+        git(s.dir, "add", ".");
+        expect(yield* planCached({ ...options(s, "c4"), out, runners })).toBeUndefined();
+      }),
+    60_000,
+  );
+
+  it.effect(
+    "reruns every test of the suite when the app built for it changes (OUTRUN_E2E_APP)",
+    () =>
+      Effect.gen(function* () {
+        const s = yield* setup();
+        expect((yield* outrunTest(options(s, "a1", { OUTRUN_E2E_APP: "k1" }))).ran).toBe(2);
+        expect((yield* outrunTest(options(s, "a2", { OUTRUN_E2E_APP: "k1" }))).replayed).toBe(2);
+        expect((yield* outrunTest(options(s, "a3", { OUTRUN_E2E_APP: "k2" }))).ran).toBe(2);
       }),
     60_000,
   );

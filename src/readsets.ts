@@ -82,7 +82,8 @@ export const saveReadSets = (state: string, bySuite: ReadonlyMap<string, { toolc
         if (!remote) return;
         const shared = mergeReadSets(parse(yield* get(remote, hash)), sets);
         const body = JSON.stringify(shared);
-        yield* put(remote, [{ hash, body, durationMs: 0, tag: "" }]);
+        const refused = yield* put(remote, [{ hash, body, durationMs: 0, tag: "" }]);
+        if (refused.count > 0) yield* Console.error(`outrun: the remote cache refused the read sets of ${suite} (${refused.statuses})`);
       }).pipe(
         // Read sets only narrow keys: failing to keep them costs a later run a wider key, nothing more.
         Effect.catchTags({
