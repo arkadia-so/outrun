@@ -146,6 +146,10 @@ describe("outrun test --e2e", () => {
         const edited = yield* planCached({ ...options(s, "c3b"), out, runners });
         expect(edited?.units.map((u) => u.id)).toEqual(listed.units.map((u) => u.id));
         expect(edited?.units[0]?.key).not.toBe(listed.units[0]?.key);
+        // A new build of the app (its key, OUTRUN_E2E_APP) is no new listing either.
+        const rebuilt = yield* planCached({ ...options(s, "c3c", { OUTRUN_E2E_APP: "k9" }), out, runners });
+        expect(rebuilt?.units.map((u) => u.id)).toEqual(listed.units.map((u) => u.id));
+        expect(rebuilt?.units[0]?.key).not.toBe(edited?.units[0]?.key);
         // A new test file is a new listing: none is kept for it.
         yield* io(() => Bun.write(`${s.dir}/web/e2e/search.e2e.ts`, "// search\n"));
         git(s.dir, "add", ".");

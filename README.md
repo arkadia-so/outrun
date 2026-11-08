@@ -226,8 +226,10 @@ built once and each shard installs it on a simulator:
 
 The build job takes the app from the fleet's cache tiers when its key was built before (`$OUTRUN_CACHE`,
 then `$OUTRUN_CACHE_PROTECTED`, written by the default branch's runs), else builds it and saves it into
-the job's tier; the shards get it from the tier or as the run's artifact. A shard installs an iOS
-`.app` on every booted simulator, so a config that names no `device` runs on it. The build is
+the job's tier; the shards get it from the tier or as the run's artifact. A shard boots its simulator first, so it
+boots while the job installs, then installs an iOS `.app` on every booted simulator, so a config that
+names no `device` runs on it. The XCTest runner e2e's iOS driver builds on its first run is kept in
+the tiers too, keyed on the driver's version and Xcode's. The build is
 skipped, with the matrix, when every test replays.
 
 The repository needs `e2e` in its dependencies, Node on the runner, `.e2e/` git-ignored (outrun

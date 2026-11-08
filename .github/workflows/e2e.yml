@@ -110,7 +110,7 @@ jobs:
       app-key: ${{ steps.app.outputs.key }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: arkadia-so/outrun@v1.2.1 # this release's own action: package.json's version (release.test.ts)
+      - uses: arkadia-so/outrun@v1.2.2 # this release's own action: package.json's version (release.test.ts)
       # Before planning, even with no install: Node's version is in the tests' keys.
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
@@ -200,7 +200,7 @@ jobs:
           done
           echo "hit=false" >>"$GITHUB_OUTPUT"
       - if: steps.cached.outputs.hit != 'true'
-        uses: arkadia-so/outrun@v1.2.1 # this release's own action: package.json's version (release.test.ts)
+        uses: arkadia-so/outrun@v1.2.2 # this release's own action: package.json's version (release.test.ts)
       - if: steps.cached.outputs.hit != 'true'
         uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
@@ -254,10 +254,26 @@ jobs:
         shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: arkadia-so/outrun@v1.2.1 # this release's own action: package.json's version (release.test.ts)
+      - uses: arkadia-so/outrun@v1.2.2 # this release's own action: package.json's version (release.test.ts)
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: ${{ inputs.node-version }}
+      - if: runner.os == 'macOS' && endsWith(inputs.app, '.app')
+        name: Simulator
+        shell: bash
+        env:
+          SIMULATOR: ${{ inputs.simulator }}
+        run: |
+          # The booted iOS simulators (e2e's mobile driver uses those), else the newest runtime's first
+          # device named like SIMULATOR, booted now so that it boots while the job installs; the App
+          # step installs the app on each.
+          booted=$(xcrun simctl list devices booted -j | jq -r '.devices | to_entries[] | select(.key | test("iOS")) | .value[].udid')
+          if [ -z "$booted" ]; then
+            booted=$(xcrun simctl list devices available -j | jq -r --arg name "$SIMULATOR" '[.devices | to_entries[] | select(.key | test("iOS"))] | sort_by(.key | capture("iOS-(?<v>[0-9-]+)").v | split("-") | map(tonumber)) | reverse | map(.value[] | select(.name | contains($name))) | first | .udid // empty')
+            [ -n "$booted" ] || { echo "outrun e2e: no iOS simulator named like '$SIMULATOR' on this runner" >&2; exit 1; }
+            xcrun simctl boot "$booted"
+          fi
+          echo "OUTRUN_SIMULATORS=$(echo "$booted" | tr '\n' ' ')" >>"$GITHUB_ENV"
       - if: inputs.bun-version != ''
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
@@ -307,25 +323,38 @@ jobs:
         shell: bash
         env:
           APP: ${{ inputs.app }}
-          SIMULATOR: ${{ inputs.simulator }}
         run: |
           mkdir -p "$(dirname "$APP")"
           rm -rf "$APP"
           tar -C "$(dirname "$APP")" -xf "$RUNNER_TEMP/app/app.tar"
-          [ "$RUNNER_OS" = macOS ] && [[ "$APP" == *.app ]] || exit 0
-          # The booted iOS simulators (e2e's mobile driver uses those), else the newest runtime's first
-          # device named like SIMULATOR, booted: the app is installed on each.
-          booted=$(xcrun simctl list devices booted -j | jq -r '.devices | to_entries[] | select(.key | test("iOS")) | .value[].udid')
-          if [ -z "$booted" ]; then
-            booted=$(xcrun simctl list devices available -j | jq -r --arg name "$SIMULATOR" '[.devices | to_entries[] | select(.key | test("iOS"))] | sort_by(.key | capture("iOS-(?<v>[0-9-]+)").v | split("-") | map(tonumber)) | reverse | map(.value[] | select(.name | contains($name))) | first | .udid // empty')
-            [ -n "$booted" ] || { echo "outrun e2e: no iOS simulator named like '$SIMULATOR' on this runner" >&2; exit 1; }
-            xcrun simctl boot "$booted"
-          fi
-          for udid in $booted; do
+          [ -n "${OUTRUN_SIMULATORS:-}" ] || exit 0
+          for udid in $OUTRUN_SIMULATORS; do
             xcrun simctl bootstatus "$udid" -b >/dev/null
             xcrun simctl install "$udid" "$APP"
             echo "outrun e2e: $APP installed on simulator $udid"
           done
+      - if: env.OUTRUN_SIMULATORS != ''
+        name: XCTest runner
+        id: runner
+        shell: bash
+        run: |
+          # e2e's iOS driver builds an XCTest runner on its first run (~40 s); it reuses a restored one
+          # only when its own manifest matches, so the entry is keyed on the driver and Xcode.
+          driver=$(find . -path '*/node_modules/agent-device/package.json' -not -path '*/node_modules/*/node_modules/*' | sort | head -1)
+          [ -n "$driver" ] || exit 0
+          key=$({ jq -r .version "$driver"; xcodebuild -version; sw_vers -productVersion; uname -m; } | shasum -a 256 | cut -c1-32)
+          entry="e2e-ios-runner-$key.tar"
+          echo "entry=$entry" >>"$GITHUB_OUTPUT"
+          for tier in "${OUTRUN_CACHE:-}" "${OUTRUN_CACHE_PROTECTED:-}"; do
+            if [ -n "$tier" ] && [ -f "$tier/$entry" ]; then
+              mkdir -p "$HOME/.agent-device/apple-runner" && tar -C "$HOME/.agent-device/apple-runner" -xf "$tier/$entry"
+              [ "$tier" = "${OUTRUN_CACHE_PROTECTED:-}" ] && mkdir -p "$OUTRUN_CACHE/.outrun-used" && touch "$OUTRUN_CACHE/.outrun-used/$entry"
+              echo "outrun e2e: XCTest runner from the cache ($entry)"
+              echo "hit=true" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "hit=false" >>"$GITHUB_OUTPUT"
       - name: e2e
         shell: bash
         env:
@@ -334,6 +363,15 @@ jobs:
           only=()
           for path in $ONLY; do only+=(--only "$path"); done
           outrun test --e2e --plan "$RUNNER_TEMP/plan/plan.json" --shard ${{ matrix.shard }}/${{ needs.plan.outputs.runners }} "${only[@]}"
+      - if: steps.runner.outputs.hit == 'false'
+        name: Save the XCTest runner
+        shell: bash
+        env:
+          ENTRY: ${{ steps.runner.outputs.entry }}
+        run: |
+          [ -n "${OUTRUN_CACHE:-}" ] && [ -d "$HOME/.agent-device/apple-runner/derived" ] || exit 0
+          tar -C "$HOME/.agent-device/apple-runner" -cf "$OUTRUN_CACHE/.$ENTRY.tmp" derived
+          mv "$OUTRUN_CACHE/.$ENTRY.tmp" "$OUTRUN_CACHE/$ENTRY"
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -350,7 +388,7 @@ jobs:
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 10
     steps:
-      - uses: arkadia-so/outrun@v1.2.1 # this release's own action: package.json's version (release.test.ts)
+      - uses: arkadia-so/outrun@v1.2.2 # this release's own action: package.json's version (release.test.ts)
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: outrun-${{ inputs.name }}-shard-*

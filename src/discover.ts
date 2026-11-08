@@ -225,7 +225,12 @@ export const discoverE2e = (repo: string, blobs: Blobs, env: Env, listings: List
                 LOCKFILES.map((l) => `**/${l}`),
               ),
             ),
-            env: hashedEnv(env, [...names]),
+            // The app's key is in the suite's keys, not its listing's: a new build reruns the tests
+            // without listing them again.
+            env: hashedEnv(
+              env,
+              [...names].filter((n) => n !== APP_ENV),
+            ),
           });
           const kept = yield* readKept(listings, key);
           let tests: readonly string[];
