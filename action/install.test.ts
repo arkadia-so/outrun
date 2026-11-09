@@ -11,8 +11,9 @@ afterEach(() => {
 });
 
 /** A job's runner folders, the action checked out as GitHub does (its files, no node_modules),
- * and a `curl` that writes `download` wherever it is asked to. */
-const job = (download: string, home?: string) => {
+ * and a `curl` that writes `download` wherever it is asked to, after failing its first `failures`
+ * calls as a 504 does (exit 22). */
+const job = (download: string, home?: string, failures = 0) => {
   const root = mkdtempSync(join(tmpdir(), "outrun-action-"));
   dirs.push(root);
   const action = join(root, "action");
@@ -23,7 +24,7 @@ const job = (download: string, home?: string) => {
   mkdirSync(fake);
   writeFileSync(
     join(fake, "curl"),
-    `#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; printf %s '${download}' > "$1"; }; shift; done\necho called >> "${root}/curl.log"\n`,
+    `#!/bin/sh\necho called >> "${root}/curl.log"\n[ "$(wc -l < "${root}/curl.log")" -le ${failures} ] && { echo "curl: (22) The requested URL returned error: 504" >&2; exit 22; }\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; printf %s '${download}' > "$1"; }; shift; done\n`,
     { mode: 0o755 },
   );
   const env = {
@@ -50,6 +51,23 @@ describe("the GitHub Action", () => {
     expect(existsSync(join(env.RUNNER_TOOL_CACHE, "outrun-bun", String(bunVersion), "bun"))).toBe(false);
     expect(readFileSync(join(root, "curl.log"), "utf8")).toBe("called\n");
   });
+
+  it("retries Bun's download when it fails once (a 504), then checks what it got", () => {
+    const { root, install } = job("not bun", tmpdir(), 1);
+    const run = install();
+    expect(run.stderr.toString()).toContain("try 1 of 3");
+    expect(run.stderr.toString()).toMatch(/has SHA-256 \w+, expected \w+/);
+    expect(readFileSync(join(root, "curl.log"), "utf8")).toBe("called\ncalled\n");
+  });
+
+  it("gives up on Bun's download after three failed tries, and puts nothing on PATH", () => {
+    const { root, env, install } = job("not bun", tmpdir(), 3);
+    const run = install();
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr.toString()).toContain("cannot download Bun");
+    expect(readFileSync(env.GITHUB_PATH, "utf8")).toBe("");
+    expect(readFileSync(join(root, "curl.log"), "utf8")).toBe("called\ncalled\ncalled\n");
+  }, 15_000);
 
   it("downloads Bun when the runner's own ~/.bun/bin/bun is another build than the pinned one", () => {
     const home = mkdtempSync(join(tmpdir(), "outrun-home-"));

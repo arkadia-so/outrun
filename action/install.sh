@@ -29,7 +29,19 @@ if [ ! -x "$bun" ] && [ -n "${binary:-}" ] && [ -x "$own" ] && [ "$(shasum -a 25
 fi
 if [ ! -x "$bun" ]; then
   tmp=$(mktemp -d "${RUNNER_TEMP:?}/outrun-bun.XXXXXX")
-  curl -fsSL --retry 3 -o "$tmp/bun.zip" "https://github.com/oven-sh/bun/releases/download/bun-v$BUN_VERSION/bun-$platform.zip"
+  # Three tries, 1 s then 2 s apart, each at most 60 s: curl's own --retry gives up on some
+  # failures (a 504 mid-redirect ended as curl error 56 and failed a job, OUT-45, 2026-11-09).
+  url="https://github.com/oven-sh/bun/releases/download/bun-v$BUN_VERSION/bun-$platform.zip"
+  for attempt in 1 2 3; do
+    curl -fsSL --connect-timeout 10 --max-time 60 -o "$tmp/bun.zip" "$url" && break
+    if [ "$attempt" = 3 ]; then
+      echo "outrun: cannot download Bun $BUN_VERSION from $url" >&2
+      rm -rf "$tmp"
+      exit 1
+    fi
+    echo "outrun: Bun's download failed (try $attempt of 3), retrying" >&2
+    sleep "$attempt"
+  done
   if command -v sha256sum >/dev/null 2>&1; then
     actual=$(sha256sum "$tmp/bun.zip" | cut -d' ' -f1)
   else
