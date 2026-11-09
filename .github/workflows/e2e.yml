@@ -73,7 +73,7 @@ on:
         type: string
         default: ""
       simulator:
-        description: On macOS, with an iOS .app, the simulator a shard boots when none is booted, by name (the newest runtime's first match)
+        description: On macOS, with an iOS .app, the simulator a shard boots when none is booted, by name (the newest runtime's first match; made from the device type of that exact name when the image has none)
         type: string
         default: iPhone
       env:
@@ -136,7 +136,7 @@ jobs:
       APP: ${{ inputs.app }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: arkadia-so/outrun@v1.5.0 # this release's own action: package.json's version (release.test.ts)
+      - uses: arkadia-so/outrun@v1.5.1 # this release's own action: package.json's version (release.test.ts)
       # Before planning, even with no install: Node's version is in the tests' keys.
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
@@ -277,7 +277,7 @@ jobs:
         shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: arkadia-so/outrun@v1.5.0 # this release's own action: package.json's version (release.test.ts)
+      - uses: arkadia-so/outrun@v1.5.1 # this release's own action: package.json's version (release.test.ts)
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: ${{ inputs.node-version }}
@@ -288,12 +288,21 @@ jobs:
           SIMULATOR: ${{ inputs.simulator }}
         run: |
           # The booted iOS simulators (e2e's mobile driver uses those), else the newest runtime's first
-          # device named like SIMULATOR, booted now so that it boots while the job installs; the App
+          # device named like SIMULATOR (made when the image has none), booted now so that it boots while
+          # the job installs; the App
           # step installs the app on each.
           booted=$(xcrun simctl list devices booted -j | jq -r '.devices | to_entries[] | select(.key | test("iOS")) | .value[].udid')
           if [ -z "$booted" ]; then
             booted=$(xcrun simctl list devices available -j | jq -r --arg name "$SIMULATOR" '[.devices | to_entries[] | select(.key | test("iOS"))] | sort_by(.key | capture("iOS-(?<v>[0-9-]+)").v | split("-") | map(tonumber)) | reverse | map(.value[] | select(.name | contains($name))) | first | .udid // empty')
-            [ -n "$booted" ] || { echo "outrun e2e: no iOS simulator named like '$SIMULATOR' on this runner" >&2; exit 1; }
+            if [ -z "$booted" ]; then
+              # None of that name on this image: made from the device type of that exact name, on the
+              # newest available iOS runtime that supports it.
+              type=$(xcrun simctl list devicetypes -j | jq -r --arg name "$SIMULATOR" '[.devicetypes[] | select(.name == $name)] | first | .identifier // empty')
+              runtime=$(xcrun simctl list runtimes -j | jq -r --arg type "$type" '[.runtimes[] | select(.platform == "iOS" and .isAvailable and any(.supportedDeviceTypes[]; .identifier == $type))] | sort_by(.version | split(".") | map(tonumber)) | last | .identifier // empty')
+              { [ -n "$type" ] && [ -n "$runtime" ]; } || { echo "outrun e2e: no iOS simulator named like '$SIMULATOR' on this runner, and no device type of that name to make one" >&2; exit 1; }
+              booted=$(xcrun simctl create "$SIMULATOR" "$type" "$runtime")
+              echo "outrun e2e: made $SIMULATOR on $runtime"
+            fi
             xcrun simctl boot "$booted"
           fi
           echo "OUTRUN_SIMULATORS=$(echo "$booted" | tr '\n' ' ')" >>"$GITHUB_ENV"
@@ -414,7 +423,7 @@ jobs:
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 10
     steps:
-      - uses: arkadia-so/outrun@v1.5.0 # this release's own action: package.json's version (release.test.ts)
+      - uses: arkadia-so/outrun@v1.5.1 # this release's own action: package.json's version (release.test.ts)
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: outrun-${{ inputs.name }}-shard-*
