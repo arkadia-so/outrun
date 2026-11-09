@@ -3,12 +3,12 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
-import { CheckApi, type CheckEvent, NotRun, Repo, runRepoCheck, splitUnits, type Unit } from "./check.ts";
+import { changeMessage, CheckApi, type CheckEvent, MESSAGE_MAX_CHARS, NotRun, Repo, runRepoCheck, splitUnits, type Unit } from "./check.ts";
 
 const SHA = "a".repeat(40);
 
 // A control plane whose workers answer at once: `plan` is worker 0's plan, `fail` the shards that fail.
-const fake = (opts: { workers: number; plan: Unit[] | undefined; fail?: number[]; refuse?: string; lose?: boolean }) => {
+const fake = (opts: { workers: number; plan: Unit[] | undefined; fail?: number[]; refuse?: string; lose?: boolean; message?: string }) => {
   const calls: string[] = [];
   const events: CheckEvent[] = [];
   const names = Array.from({ length: opts.workers }, (_, i) => `chk-c-${i}`);
@@ -22,9 +22,10 @@ const fake = (opts: { workers: number; plan: Unit[] | undefined; fail?: number[]
         for (const worker of names) push({ worker, step: "up", code: 0, json: {} });
         return Effect.succeed({ id: "c", sha: SHA, workers: names.map((name, i) => ({ name, mini: `mm${i + 1}` })) });
       }),
-    patch: (_id, patch) =>
+    patch: (_id, patch, message) =>
       Effect.sync(() => {
         calls.push(`patch ${patch}`);
+        if (message) calls.push(`message ${message}`);
         if (opts.lose) return void push({ worker: names[1]!, step: "lost", code: -1, json: {}, log: "mm2 left the fleet" });
         names.forEach((worker, i) =>
           push({ worker, step: "apply", code: 0, json: i === 0 ? { apply: 300, plan: 4000, ...(opts.plan ? { units: opts.plan } : {}) } : { apply: 300 } }),
@@ -50,6 +51,7 @@ const fake = (opts: { workers: number; plan: Unit[] | undefined; fail?: number[]
   const repo = Layer.succeed(Repo, {
     name: Effect.succeed("acme/app"),
     patchFrom: (sha) => Effect.succeed(`diff from ${sha.slice(0, 4)}`),
+    messageFrom: () => Effect.succeed(opts.message ?? ""),
   });
   return { calls, layer: Layer.merge(api, repo) };
 };
@@ -72,6 +74,23 @@ describe("splitUnits", () => {
   });
 });
 
+describe("changeMessage", () => {
+  it("keeps one commit's message as is, its trailers already last", () => {
+    expect(changeMessage("Fix it\n\nNo-Changelog: internal\n\n", "No-Changelog: internal\n\n")).toBe("Fix it\n\nNo-Changelog: internal");
+    expect(changeMessage("Fix it\n", "\n")).toBe("Fix it");
+  });
+  it("ends several commits' messages with all their trailers, once each, so git reads every one as the commit's", () => {
+    const bodies = "Second\n\nRefs: A-1\n\nFirst\n\nNo-Changelog: internal\nRefs: A-1\n";
+    const trailers = "Refs: A-1\n\nNo-Changelog: internal\nRefs: A-1\n\n";
+    expect(changeMessage(bodies, trailers)).toBe("Second\n\nRefs: A-1\n\nFirst\n\nNo-Changelog: internal\nRefs: A-1\n\nRefs: A-1\nNo-Changelog: internal");
+  });
+  it("cuts a long message to the control plane's bound, keeping the trailers", () => {
+    const cut = changeMessage(`${"x".repeat(MESSAGE_MAX_CHARS)}\n\nOther: 1`, "No-Changelog: y\n");
+    expect(cut.length).toBe(MESSAGE_MAX_CHARS);
+    expect(cut.endsWith("\n\nNo-Changelog: y")).toBe(true);
+  });
+});
+
 describe("outrun check", () => {
   it.effect("sends HEAD's tree on the warm commit, splits the first worker's plan by the units' times, and ends the check", () =>
     Effect.gen(function* () {
@@ -82,6 +101,14 @@ describe("outrun check", () => {
       const expected = splitUnits(PLAN, 3).map((tasks, worker) => ({ worker, tasks }));
       expect(calls[2]).toBe(`shards ${JSON.stringify(expected)}`);
       expect(calls.at(-1)).toBe("end c");
+    }),
+  );
+
+  it.effect("sends the change's commit messages with its patch, so a check reading a trailer sees it on the fleet", () =>
+    Effect.gen(function* () {
+      const { calls, layer } = fake({ workers: 1, plan: [], message: "Fix the thing\n\nNo-Changelog: internal" });
+      yield* runRepoCheck(1).pipe(Effect.provide(layer));
+      expect(calls.slice(1, 3)).toEqual(["patch diff from aaaa", "message Fix the thing\n\nNo-Changelog: internal"]);
     }),
   );
 

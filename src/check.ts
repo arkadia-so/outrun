@@ -58,7 +58,8 @@ export class CheckApi extends Context.Service<
   CheckApi,
   {
     readonly create: (repo: string, workers: number) => Effect.Effect<Created, NotRun>;
-    readonly patch: (id: string, patch: string) => Effect.Effect<void, NotRun>;
+    // `message`: the commit messages of the change (Repo `messageFrom`), the VM's commit's.
+    readonly patch: (id: string, patch: string, message: string) => Effect.Effect<void, NotRun>;
     readonly shards: (id: string, shards: readonly { worker: number; tasks: readonly string[] }[]) => Effect.Effect<void, NotRun>;
     readonly events: (id: string, after: number) => Effect.Effect<readonly CheckEvent[], NotRun>;
     readonly end: (id: string) => Effect.Effect<void>;
@@ -71,6 +72,9 @@ export class Repo extends Context.Service<
   {
     readonly name: Effect.Effect<string, NotRun>;
     readonly patchFrom: (sha: string) => Effect.Effect<string, NotRun>;
+    // The messages of the commits HEAD has and `sha` lacks, newest first: what the checks see as the
+    // change's commits (a trailer such as `No-Changelog:`), as a local run reads them with git log.
+    readonly messageFrom: (sha: string) => Effect.Effect<string, NotRun>;
   }
 >()("outrun/cli/Repo") {}
 
@@ -150,7 +154,7 @@ export const runRepoCheck = (workers: number) =>
     return yield* Effect.gen(function* () {
       const n = check.workers.length;
       const patch = yield* repo.patchFrom(check.sha);
-      yield* api.patch(check.id, patch);
+      yield* api.patch(check.id, patch, yield* repo.messageFrom(check.sha));
       // Every worker up and patched; the first's apply carries the plan.
       const ready = yield* waitFor(check.id, 0, (events) => events.filter((e) => e.step === "apply").length === n, deadline);
       const failed = ready.events.find((e) => e.code !== 0);
@@ -219,7 +223,34 @@ const RepoLive = Layer.succeed(Repo, {
       Effect.catchTag("NotRun", () => exec("git", ["fetch", "-q", "origin", sha])),
       Effect.andThen(exec("git", ["diff", "--binary", "--no-color", "--no-ext-diff", sha, "HEAD"])),
     ),
+  // After patchFrom, which fetched `sha` when this clone lacked it.
+  messageFrom: (sha) =>
+    Effect.all([
+      exec("git", ["log", "--no-merges", "--format=%B", `${sha}..HEAD`]),
+      exec("git", ["log", "--no-merges", "--format=%(trailers:only,unfold)", `${sha}..HEAD`]),
+    ]).pipe(Effect.map(([bodies, trailers]) => changeMessage(bodies, trailers))),
 });
+
+// The control plane's bound on a check's message (control-plane checks.ts MESSAGE_MAX_CHARS).
+export const MESSAGE_MAX_CHARS = 64 * 1024;
+
+// The one commit message standing for the change's commits on the VM: their messages, newest first,
+// then every trailer of them as the last paragraph, which git reads as the commit's trailers (a check
+// reading `%(trailers)` of the range sees those of every commit, not only the oldest's). Cut to
+// MESSAGE_MAX_CHARS, the trailers kept.
+export const changeMessage = (bodies: string, trailers: string) => {
+  const body = bodies.trim();
+  const block = [
+    ...new Set(
+      trailers
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean),
+    ),
+  ].join("\n");
+  if (!block || body.endsWith(`\n\n${block}`) || body === block) return body.slice(0, MESSAGE_MAX_CHARS);
+  return `${body.slice(0, Math.max(0, MESSAGE_MAX_CHARS - block.length - 2))}\n\n${block}`.slice(0, MESSAGE_MAX_CHARS);
+};
 
 const checkApiLive = (api: string, installation: string, token: string, githubToken: string | undefined) => {
   const base = `${api}/v1/installations/${installation}/checks`;
@@ -253,7 +284,7 @@ const checkApiLive = (api: string, installation: string, token: string, githubTo
         body: { protocol: CHECK_PROTOCOL, repo, workers },
         ...(githubToken ? { headers: { "x-github-token": githubToken } } : {}),
       }).pipe(Effect.map((body) => body as unknown as Created)),
-    patch: (id, patch) => request(`/${id}/patch`, { method: "POST", body: { patch } }).pipe(Effect.asVoid),
+    patch: (id, patch, message) => request(`/${id}/patch`, { method: "POST", body: { patch, message } }).pipe(Effect.asVoid),
     shards: (id, shards) => request(`/${id}/shards`, { method: "POST", body: { shards } }).pipe(Effect.asVoid),
     events: (id, after) =>
       request(`/${id}/events?after=${after}`, { method: "GET" }, 40_000).pipe(Effect.map((body) => (body.events ?? []) as readonly CheckEvent[])),

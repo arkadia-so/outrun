@@ -298,7 +298,10 @@ the time of the longest share. The repository declares its check in `.outrun/che
   `prefill` (optional, runs the check once so its caches are warm; its failure is recorded, never
   fatal), `install` (after the patch, only when a file matching `when` changed).
 - `plan` prints a JSON array of units, each an id or `{"id", "ms", "group"}`: `ms` its expected
-  time, units of one `group` kept on one VM. `OUTRUN_CHECK_BASE` is the warm commit.
+  time, units of one `group` kept on one VM. `OUTRUN_CHECK_BASE` is the warm commit; HEAD is one
+  commit on it holding the change, whose message is the change's commit messages, newest first,
+  with all their trailers last, so `git log "$OUTRUN_CHECK_BASE..HEAD"` reads them as locally
+  (since 1.5.3).
 - `run` runs the units in `OUTRUN_CHECK_UNITS` (one per line) and exits 0 when they pass. It may
   write `[{"id", "ms", "exit", "cache"}]` to `OUTRUN_CHECK_REPORT`.
 
