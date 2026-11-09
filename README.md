@@ -245,6 +245,42 @@ const gateway = createOpenAICompatible({ name: "trait", baseURL: "https://ai.tra
 export default { /* tests, targets */ agents: { default: { model: gateway("fast") } } } satisfies E2EConfig;
 ```
 
+## outrun check: the fast CI on outrun's VMs
+
+`outrun check` runs a repository's fast CI on the tree of HEAD (committed changes only) on outrun's
+Linux VMs instead of the laptop: warm checkouts of `main`, HEAD's tree sent as a patch, the units
+split over several VMs by their expected times, the verdict and the failures' logs back in about
+the time of the longest share. The repository declares its check in `.outrun/check.json`:
+
+```json
+{
+  "setup": ["curl -fsSL https://example.com/install-tools.sh | bash", "make deps"],
+  "prefill": "make check",
+  "install": { "when": ["package.json", "**/lockfile"], "run": "make deps" },
+  "plan": "tools/ci-units.sh \"$OUTRUN_CHECK_BASE\"",
+  "run": "tools/ci-run-units.sh"
+}
+```
+
+- `setup` (once per warm commit of `main`; the tools of a `mise.toml` are installed before it),
+  `prefill` (optional, runs the check once so its caches are warm; its failure is recorded, never
+  fatal), `install` (after the patch, only when a file matching `when` changed).
+- `plan` prints a JSON array of units, each an id or `{"id", "ms", "group"}`: `ms` its expected
+  time, units of one `group` kept on one VM. `OUTRUN_CHECK_BASE` is the warm commit.
+- `run` runs the units in `OUTRUN_CHECK_UNITS` (one per line) and exits 0 when they pass. It may
+  write `[{"id", "ms", "exit", "cache"}]` to `OUTRUN_CHECK_REPORT`.
+
+Each command is a bash script run at the checkout's root, stopping at its first failing line.
+
+```sh
+OUTRUN_API_TOKEN=ort_... OUTRUN_INSTALLATION=<id> OUTRUN_GITHUB_TOKEN=<a token that reads the repo> \
+  outrun check --workers 4
+```
+
+Exit 0: every unit passed; 1: one failed (its log printed); 3: outrun did not run it (unreachable,
+no warm checkout yet, no VM free): run the check locally instead. The repository must be listed in
+the installation's check settings.
+
 ## License
 
 MIT or Apache-2.0.

@@ -18,6 +18,9 @@ import { appendFile } from "node:fs/promises";
 //   outrun xcode-reads --trace-dir d --build unit [--run unit]... --out file
 //                                a traced xcodebuild's per-target read sets as each xcode test file's
 //                                observation, for `outrun test --trace`
+//   outrun check [--workers n] [--installation id]
+//                                HEAD's tree through the repository's .outrun/check.json on outrun's
+//                                Linux VMs: exit 0 passed, 1 failed, 3 not run there
 //   outrun nx-cache [--port n]   Nx's self-hosted remote cache API on 127.0.0.1, stored in outrun's cache
 //   outrun bazel-cache [--port n] Bazel's HTTP remote cache on 127.0.0.1, stored in outrun's cache
 //
@@ -32,6 +35,7 @@ import { Argument, CliError, Command, Flag } from "effect/cli";
 import pkg from "../package.json" with { type: "json" };
 import { BAZEL, buildCacheApp, NX } from "./build-cache.ts";
 import { githubOidc } from "./cache.ts";
+import { checkCommand } from "./check.ts";
 import { appKey } from "./discover.ts";
 import { e2eEnvLines } from "./e2e-env.ts";
 import { blocking, keyUnits, lookupCommand, plan, planCached, recordCommand, test } from "./engine.ts";
@@ -372,6 +376,7 @@ const outrun = Command.make("outrun").pipe(
     junitMergeCommand,
     e2eEnvCommand,
     e2eAppKeyCommand,
+    checkCommand,
   ]),
 );
 
@@ -386,6 +391,8 @@ const main = Command.run(outrun, { version: pkg.version }).pipe(
     SpawnFailed: (e) => Console.error(`outrun: ${e.message}`).pipe(Effect.as(2)),
     FileFailed: (e) => Console.error(`outrun: ${e.message}`).pipe(Effect.as(2)),
     UsageInvalid: (e) => Console.error(`outrun: ${e.message}`).pipe(Effect.as(2)),
+    CheckFailed: () => Effect.succeed(1),
+    NotRun: (e) => Console.error(`outrun check: not run on the fleet: ${e.message}`).pipe(Effect.as(3)),
   }),
   Effect.catchIf(CliError.isCliError, () => Effect.succeed(2)),
   Effect.provide(BunServices.layer),
