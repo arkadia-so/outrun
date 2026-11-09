@@ -1,6 +1,7 @@
 // Units and their keys, in two phases (BuildXL's model).
 //
-// A unit is one test file. Its weak key names how it runs: the key recipe's version, its runner,
+// A unit is one test file, or one of its tests where the suite names them (`units`: an e2e test,
+// `file:line`, keyed on its file's content and closure like the whole file). Its weak key names how it runs: the key recipe's version, its runner,
 // folder, file and command, the toolchain's fingerprint and the keyed variables' values. A strong
 // key adds the content, by git blob id ("missing" for an absent path), of a set of files the unit
 // may read, plus the suite's own inputs (the global inputs such as the lockfile, the preloads'
@@ -43,12 +44,16 @@ export interface ReadSet {
 type ReadSets = ReadonlyMap<string, readonly ReadSet[]>;
 
 export interface Unit {
-  /** The file, repository-relative: stable and readable. */
+  /** The file, repository-relative (with `:line` for a test within it): stable and readable. */
   readonly id: string;
+  /** The test file, repository-relative, when `id` names a test within it. */
+  readonly path?: string;
+  /** The name its timing and quarantine are kept under, when not `id` (a test's title path, which survives a line move). */
+  readonly timing?: string;
   readonly runner: Suite["adapter"];
   /** The suite's folder, repository-relative: where its runner starts. */
   readonly cwd: string;
-  /** The file relative to cwd: what its runner is given. */
+  /** The file relative to cwd (with `:line` for a test within it): what its runner is given. */
   readonly file: string;
   readonly suite: Suite;
   /** The import closure's files (sorted), besides the suite's inputs. */
@@ -129,10 +134,10 @@ const treeOf = (blobs: Blobs): Tree => {
 };
 
 /** Pure: the key of a traced read set: what it read by content, the folders it listed by their entries, the rest by presence. */
-const tracedStrongKey = (weak: string, suiteDigest: string, blobs: Blobs, id: string, set: Pick<ReadSet, "reads" | "present">) => {
+const tracedStrongKey = (weak: string, suiteDigest: string, blobs: Blobs, path: string, set: Pick<ReadSet, "reads" | "present">) => {
   const tree = treeOf(blobs);
   const folders = set.reads.filter((r) => r.endsWith("/"));
-  const files = [id, ...set.reads.filter((r) => !r.endsWith("/"))];
+  const files = [path, ...set.reads.filter((r) => !r.endsWith("/"))];
   const listed = [...new Set(folders)].sort().map((f) => {
     const dir = f.replace(/\/+$/, "");
     const entries = tree.get(dir === "." ? "" : dir);
@@ -175,33 +180,43 @@ export const computeUnits = (context: KeyContext): Unit[] => {
     const toolchain = context.toolchain[suite.adapter] ?? "";
     const envParts = [...keyedEnv(env, [...(config.env ?? []), ...(suite.env ?? [])]), ...hashedEnv(env, suite.hashedEnv ?? [])];
     const run = [...suite.run, ...(suite.xcode ? [JSON.stringify(suite.xcode)] : [])];
-    for (const id of matching(blobs, suite.dir, suite.tests, suite.exclude)) {
-      const file = suite.dir === "." ? id : posix.relative(suite.dir, id);
-      const files = new Set<string>([id]);
+    const within = new Map<string, NonNullable<Suite["units"]>[number][]>();
+    for (const u of suite.units ?? []) within.set(u.file, [...(within.get(u.file) ?? []), u]);
+    for (const path of matching(blobs, suite.dir, suite.tests, suite.exclude)) {
+      const relative = suite.dir === "." ? path : posix.relative(suite.dir, path);
+      const files = new Set<string>([path]);
       if (sources.has("imports")) {
-        const closure = graph.closure([id]);
+        const closure = graph.closure([path]);
         for (const f of closure.files) files.add(f);
         for (const w of closure.wholes) for (const f of graph.filesUnder(w)) files.add(f);
       }
-      const weak = weakKey({ runner: suite.adapter, cwd: suite.dir, file, run, toolchain, env: envParts });
-      const key = strongKey(weak, suiteDigest, blobs, files);
-      const traced = readSets.get(weak) ?? [];
-      const net = traced.find((s) => s.net);
-      units.push({
-        id,
-        runner: suite.adapter,
-        cwd: suite.dir,
-        file,
-        suite,
-        inputs: [...files].sort(),
-        weak,
-        suiteDigest,
-        tracedDigest,
-        key,
-        candidates: [key, ...traced.map((s) => tracedStrongKey(weak, tracedDigest, blobs, id, s))],
-        cacheable: !net,
-        ...(net ? { reason: "a traced run used the network" } : {}),
-      });
+      const inputs = [...files].sort();
+      for (const part of suite.units ? (within.get(relative) ?? []) : [undefined]) {
+        const suffix = part?.line === undefined ? "" : `:${part.line}`;
+        const file = `${relative}${suffix}`;
+        const id = `${path}${suffix}`;
+        const weak = weakKey({ runner: suite.adapter, cwd: suite.dir, file, run, toolchain, env: envParts });
+        const key = strongKey(weak, suiteDigest, blobs, files);
+        const traced = readSets.get(weak) ?? [];
+        const net = traced.find((s) => s.net);
+        units.push({
+          id,
+          ...(suffix ? { path } : {}),
+          ...(part ? { timing: `${path} › ${part.name}` } : {}),
+          runner: suite.adapter,
+          cwd: suite.dir,
+          file,
+          suite,
+          inputs,
+          weak,
+          suiteDigest,
+          tracedDigest,
+          key,
+          candidates: [key, ...traced.map((s) => tracedStrongKey(weak, tracedDigest, blobs, path, s))],
+          cacheable: !net,
+          ...(net ? { reason: "a traced run used the network" } : {}),
+        });
+      }
     }
   }
   return units;
@@ -209,7 +224,7 @@ export const computeUnits = (context: KeyContext): Unit[] => {
 
 /** Pure: the key a traced pass is written under, from what this run saw. */
 export const tracedKey = (unit: Unit, blobs: Blobs, set: Pick<ReadSet, "reads" | "present">) =>
-  tracedStrongKey(unit.weak, unit.tracedDigest, blobs, unit.id, set);
+  tracedStrongKey(unit.weak, unit.tracedDigest, blobs, unit.path ?? unit.id, set);
 
 export interface KeyedCommand {
   readonly name: string;

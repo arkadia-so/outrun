@@ -4,6 +4,11 @@
 // never answered), which leaves no file passed. The report goes under `.e2e/` (the CLI refuses an
 // output outside the project root; `.e2e/` is the folder its own runs write and ignore). The CLI's
 // own version comes from the lockfile, which the discovered suites key (discover.ts).
+//
+// A batch of tests (`file:line` units, discover.ts) is given as those positionals, and its results
+// come from e2e's own report (`report.json`, schema report-v1): each result names the line its test
+// is declared at and its serial group, so a group's members fold into the group's unit at its first
+// line. The JUnit report is still written, for the run's merged report.
 import { Effect } from "effect";
 import { nearestCli } from "../discover.ts";
 import { FileFailed, SpawnFailed } from "../errors.ts";
@@ -25,6 +30,61 @@ export const e2eResults = (xml: string, files: readonly string[], exitCode: numb
   if (exitCode !== 0 && [...out.values()].every((r) => r.passed)) return new Map();
   return out;
 };
+
+interface ReportResult {
+  readonly file?: unknown;
+  readonly source?: { readonly line?: unknown };
+  readonly serialGroupId?: unknown;
+  readonly status?: unknown;
+  readonly attempts?: readonly { readonly durationMs?: unknown }[];
+}
+
+/**
+ * Pure: per-test results of e2e's report.json for these `file:line` units. A result counts toward the
+ * unit at its line, a serial group's toward the group's first line; a unit passes when none of its
+ * results failed or timed out, and one with an interrupted result, or none, did not finish. A
+ * run-level error, or a failed exit while every unit passed, passes none.
+ */
+export const e2eTestResults = (json: string, units: readonly string[], exitCode: number | null): Map<string, UnitResult> => {
+  let parsed: { run?: { errors?: readonly unknown[]; results?: readonly ReportResult[] } };
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return new Map();
+  }
+  const run = parsed.run ?? {};
+  if ((run.errors ?? []).length > 0) return new Map();
+  const results = (run.results ?? []).filter(
+    (r): r is ReportResult & { file: string; source: { line: number } } => typeof r.file === "string" && typeof r.source?.line === "number",
+  );
+  const first = new Map<string, number>();
+  for (const r of results)
+    if (typeof r.serialGroupId === "string") {
+      const id = `${r.file}\0${r.serialGroupId}`;
+      first.set(id, Math.min(first.get(id) ?? r.source.line, r.source.line));
+    }
+  const wanted = new Set(units);
+  const acc = new Map<string, { failed: boolean; unfinished: boolean; durationMs: number; tests: number }>();
+  for (const r of results) {
+    const line = typeof r.serialGroupId === "string" ? (first.get(`${r.file}\0${r.serialGroupId}`) as number) : r.source.line;
+    // A file with no lines listed is a unit of its own.
+    const unit = wanted.has(r.file) ? r.file : `${r.file}:${line}`;
+    if (!wanted.has(unit)) continue;
+    const a = acc.get(unit) ?? { failed: false, unfinished: false, durationMs: 0, tests: 0 };
+    a.failed ||= r.status === "failed" || r.status === "timed-out";
+    a.unfinished ||= r.status === "interrupted";
+    a.durationMs += (r.attempts ?? []).reduce((s, x) => s + (typeof x.durationMs === "number" ? x.durationMs : 0), 0);
+    a.tests += 1;
+    acc.set(unit, a);
+  }
+  const out = new Map<string, UnitResult>();
+  for (const [unit, a] of acc) if (!a.unfinished) out.set(unit, { passed: !a.failed, durationMs: a.durationMs, tests: a.tests });
+  if (exitCode !== 0 && [...out.values()].every((r) => r.passed)) return new Map();
+  return out;
+};
+
+/** Pure: whether a batch's files are tests within files (`file:line`), not whole files. */
+const LINE = /:\d+$/;
 
 /** Pure: the run's argv with junit among its reporters (`--reporter a,b` or a list of its own). */
 export const withJunit = (run: readonly string[]): string[] => {
@@ -60,6 +120,19 @@ export const e2eAdapter: Adapter = {
     const output = `.e2e/outrun-${process.pid}-${++batchCount}`;
     const cwd = suite.dir === "." ? repo : `${repo}/${suite.dir}`;
     const report = `${cwd}/${output}/junit.xml`;
+    const tests = files.some((f) => LINE.test(f));
+    if (tests) {
+      const json = `${cwd}/${output}/report.json`;
+      return {
+        argv: [...withJunit(withCli(suite.run, nearestCli(repo, suite.dir))), "--output", output, ...files],
+        cwd,
+        results: (exit) =>
+          Effect.tryPromise({
+            try: async () => ((await Bun.file(json).exists()) ? await Bun.file(json).text() : ""),
+            catch: () => new FileFailed({ message: `${json}: unreadable` }),
+          }).pipe(Effect.map((text) => e2eTestResults(text, files, exit.code))),
+      };
+    }
     return {
       // The suite's run names its progress reporter (list); junit is added for the per-file results.
       argv: [...withJunit(withCli(suite.run, nearestCli(repo, suite.dir))), "--output", output, ...files],

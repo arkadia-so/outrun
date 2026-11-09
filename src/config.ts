@@ -35,6 +35,20 @@ const Suite = Schema.Struct({
   /** Globs of the test files, relative to dir. */
   tests: Schema.Array(Schema.String),
   exclude: Schema.optional(Schema.Array(Schema.String)),
+  /**
+   * The units within the test files, when finer than a file (e2e: a test or serial group, named
+   * `file:line` by the line its runner selects it at; `name` keeps its timing across line moves).
+   * A test file none names has no unit. Absent: each file is a unit.
+   */
+  units: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        file: Schema.String,
+        line: Schema.optional(Schema.Number),
+        name: Schema.String,
+      }),
+    ),
+  ),
   /** The command of a batch, before the adapter's own arguments. */
   run: Schema.Array(Schema.String),
   roots: Schema.optional(Schema.Array(Schema.String)),

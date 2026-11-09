@@ -239,8 +239,8 @@ const lookup = (
 ) =>
   Effect.gen(function* () {
     const toolchainOf = (u: Unit) => toolchains[u.runner] ?? "";
-    const timing = new Map(units.map((u) => [u.id, timingKey(u.id, toolchainOf(u))]));
-    const quarantine = new Map(units.map((u) => [u.id, quarantineKey(u.id, toolchainOf(u))]));
+    const timing = new Map(units.map((u) => [u.id, timingKey(u.timing ?? u.id, toolchainOf(u))]));
+    const quarantine = new Map(units.map((u) => [u.id, quarantineKey(u.timing ?? u.id, toolchainOf(u))]));
     const suites = new Map(units.map((u) => [u.suite.name, divergenceKey(u.suite.name, toolchainOf(u))]));
     const hashes = [
       ...new Set([...units.flatMap((u) => u.candidates), ...timing.values(), ...quarantine.values(), ...suites.values(), ...commands.map((c) => c.key)]),
@@ -302,7 +302,7 @@ const audited = (key: string, runId: string, fraction: number) =>
   fraction > 0 && Number.parseInt(sha256(`${runId}\n${key}`).slice(0, 8), 16) / 2 ** 32 < fraction;
 
 const filterOnly = (units: readonly Unit[], only: readonly string[] | undefined) =>
-  only ? units.filter((u) => only.some((o) => u.id === o || u.id.startsWith(`${o.replace(/\/$/, "")}/`))) : units;
+  only ? units.filter((u) => only.some((o) => u.id === o || u.path === o || u.id.startsWith(`${o.replace(/\/$/, "")}/`))) : units;
 
 /** Keys, lookups, and what is left to run: the misses, and the audits picked among the hits. */
 type Keyed = Effect.Success<ReturnType<typeof keyUnits>>;
@@ -640,7 +640,7 @@ export const test = (options: TestOptions) =>
               const failed = batch.units.filter((u) => results.get(u.file)?.passed === false).length;
               const missing = batch.units.filter((u) => !results.has(u.file)).length;
               return Console.error(
-                `  ${failed + missing === 0 ? "ok  " : "FAIL"} ${batch.suite}: ${batch.units.length} files in ${seconds(exited.durationMs)} (expected ${seconds(batch.expectedMs)})${failed ? `, ${failed} failed` : ""}${missing ? `, ${missing} unfinished${exited.killed ? ` (killed: ${exited.killed})` : ""}` : ""}`,
+                `  ${failed + missing === 0 ? "ok  " : "FAIL"} ${batch.suite}: ${batch.units.length} units in ${seconds(exited.durationMs)} (expected ${seconds(batch.expectedMs)})${failed ? `, ${failed} failed` : ""}${missing ? `, ${missing} unfinished${exited.killed ? ` (killed: ${exited.killed})` : ""}` : ""}`,
               );
             }),
           ),
@@ -827,7 +827,7 @@ const record = (
         }
       }
       if (o.status === "flaky")
-        add(quarantineKey(u.id, toolchain), JSON.stringify({ unit: u.id, key: u.key, at }), 0, formatTag({ run: options.runId, at, tier }));
+        add(quarantineKey(u.timing ?? u.id, toolchain), JSON.stringify({ unit: u.id, key: u.key, at }), 0, formatTag({ run: options.runId, at, tier }));
       if (u.audit && !quarantined && (o.status === "failed" || o.status === "unfinished"))
         add(
           divergenceKey(u.suite.name, toolchain),

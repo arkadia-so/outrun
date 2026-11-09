@@ -1,20 +1,24 @@
 name: outrun e2e
 # Any TesterArmy e2e suite, fanned out over outrun's runners with no configuration (README, "End-to-end
-# tests"). Every e2e.config of the checkout is a suite and each of its test files a unit: a unit whose
-# key already passed is replayed, the others are spread over as many runners as the wall time aims for,
-# by the durations outrun learned, and their JUnit reports are merged into one.
+# tests"). Every e2e.config of the checkout is a suite and each of its tests a unit (a serial group is
+# one): a unit whose key already passed is replayed, the others are spread over as many runners as the
+# wall time aims for, by the per-test durations outrun learned, and their JUnit reports are merged.
 #
 # The plan job installs nothing when every config was already listed with the same inputs (a kept
-# listing, in outrun's cache): it plans, and only the shards install. An app the tests drive on a
-# device (an iOS simulator `.app`) is built once per run by `build`, cached in the fleet's tiers by
-# its inputs' content, and installed on a simulator each macOS shard boots:
+# listing, in outrun's cache) and the app is cached. An app the tests drive on a device (an iOS
+# simulator `.app`) is built once per run, in the plan job, cached in the fleet's tiers by its inputs'
+# content, and installed on a simulator each macOS shard boots; the build's own cache folders
+# (`build-cache`) come back from the tiers before a build, so a new key builds incrementally:
 #
 #       with:
 #         runs-on: outrun-macos
 #         install: npm ci
 #         build: ./scripts/build-simulator-app.sh
 #         build-inputs: ios/** package-lock.json
+#         build-cache: build/ios ios/Pods
 #         app: build/Acme.app
+#         filter: --exclude-tag release --exclude-tag push
+#         environment: e2e
 #
 #   jobs:
 #     e2e:
@@ -60,6 +64,10 @@ on:
         description: Globs of the files the build reads, from the repository's root, separated by spaces (`!glob` excludes); its cache key with the command and the runner's image
         type: string
         default: "**"
+      build-cache:
+        description: Folders the build keeps its own cache in (a framework's build folder), from the root, separated by spaces; restored from the fleet's cache tiers before a build and saved after it, so a new app key builds incrementally
+        type: string
+        default: ""
       app:
         description: What the build makes (a file or folder, from the repository's root), given to every shard at the same path; an iOS .app is installed on a booted simulator
         type: string
@@ -74,6 +82,14 @@ on:
         default: ""
       env-secrets:
         description: Names of the caller's secrets given to the tests as variables of the same name, separated by spaces
+        type: string
+        default: ""
+      filter:
+        description: e2e's selection flags, applied when the tests are listed (a test they leave out is no unit) and in every unit's key, e.g. `--exclude-tag release --tag smoke --grep checkout`; only --tag, --tag-mode, --exclude-tag, --grep, --grep-invert and --target
+        type: string
+        default: ""
+      environment:
+        description: The GitHub environment of the jobs that plan, build and run the tests (its secrets, its OIDC subject); none by default
         type: string
         default: ""
       only:
@@ -103,14 +119,18 @@ env:
 jobs:
   plan:
     runs-on: ${{ inputs.runs-on }}
-    timeout-minutes: 15
+    # An empty name is no environment.
+    environment: ${{ inputs.environment }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     outputs:
       runners: ${{ steps.plan.outputs.runners || steps.listed.outputs.runners }}
       matrix: ${{ steps.plan.outputs.matrix || steps.listed.outputs.matrix }}
       app-key: ${{ steps.app.outputs.key }}
+    env:
+      APP: ${{ inputs.app }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: arkadia-so/outrun@v1.3.0 # this release's own action: package.json's version (release.test.ts)
+      - uses: arkadia-so/outrun@v1.4.0 # this release's own action: package.json's version (release.test.ts)
       # Before planning, even with no install: Node's version is in the tests' keys.
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
@@ -121,7 +141,11 @@ jobs:
           VARIABLES: ${{ inputs.env }}
           NAMES: ${{ inputs.env-secrets }}
           SECRETS: ${{ toJSON(secrets) }}
-        run: outrun e2e-env >>"$GITHUB_ENV"
+          FILTER: ${{ inputs.filter }}
+        run: |
+          outrun e2e-env >>"$GITHUB_ENV"
+          case "$FILTER" in *$'\n'*) echo "outrun e2e: the filter input is one line" >&2; exit 1 ;; esac
+          echo "OUTRUN_E2E_FILTER=$FILTER" >>"$GITHUB_ENV"
       - id: app
         if: inputs.build != ''
         name: App key
@@ -129,11 +153,13 @@ jobs:
         env:
           BUILD: ${{ inputs.build }}
           INPUTS: ${{ inputs.build-inputs }}
+          CACHE: ${{ inputs.build-cache }}
         run: |
           set -f
-          globs=()
-          for glob in $INPUTS; do globs+=(--inputs "$glob"); done
-          key=$(outrun e2e-app-key --build "$BUILD" "${globs[@]}")
+          args=()
+          for glob in $INPUTS; do args+=(--inputs "$glob"); done
+          for path in $CACHE; do args+=(--cache "$path"); done
+          key=$(outrun e2e-app-key --build "$BUILD" "${args[@]}")
           echo "OUTRUN_E2E_APP=$key" >>"$GITHUB_ENV"
       # Every config already listed with these inputs: planned with no install.
       - id: plan
@@ -145,11 +171,29 @@ jobs:
           only=()
           for path in $ONLY; do only+=(--only "$path"); done
           outrun plan --e2e --cached-listings --out "$RUNNER_TEMP/plan.json" --max-runners ${{ inputs.max-runners }} --target ${{ inputs.target }} "${only[@]}"
-      - if: steps.plan.outputs.planned == 'false' && inputs.bun-version != ''
+      - id: cached
+        # Unplanned yet (no kept listing) is no `runners` output: null, which equals '0' in an expression.
+        if: inputs.build != '' && (steps.plan.outputs.runners || 'unplanned') != '0'
+        name: Cached app
+        shell: bash
+        run: outrun tier restore "e2e-app-${{ steps.app.outputs.key }}.tar" "$RUNNER_TEMP/app.tar"
+      # The install, only to list a config or to build the app.
+      - id: need
+        name: What this job does
+        shell: bash
+        env:
+          PLANNED: ${{ steps.plan.outputs.planned }}
+          BUILD: ${{ inputs.build != '' && (steps.plan.outputs.runners || 'unplanned') != '0' && steps.cached.outputs.hit != 'true' }}
+        run: |
+          if [ "$PLANNED" = false ] || [ "$BUILD" = true ]; then
+            echo "outrun e2e: installing (a listing to make: $([ "$PLANNED" = false ] && echo yes || echo no); the app to build: $BUILD)"
+            echo "install=true" >>"$GITHUB_OUTPUT"
+          fi
+      - if: steps.need.outputs.install == 'true' && inputs.bun-version != ''
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: ${{ inputs.bun-version }}
-      - if: steps.plan.outputs.planned == 'false'
+      - if: steps.need.outputs.install == 'true'
         name: Install
         shell: bash
         run: ${{ inputs.install }}
@@ -168,74 +212,47 @@ jobs:
           name: outrun-${{ inputs.name }}-plan
           path: ${{ runner.temp }}/plan.json
           retention-days: 1
-
-  # The app, once per run: from the fleet's cache tiers when its key was built before, else built
-  # here and saved into this job's tier; given to the shards as an artifact (a shard on another
-  # machine has no copy of the tier).
-  build:
-    needs: plan
-    if: inputs.build != '' && needs.plan.outputs.runners != '0'
-    runs-on: ${{ inputs.runs-on }}
-    timeout-minutes: ${{ inputs.timeout-minutes }}
-    env:
-      KEY: ${{ needs.plan.outputs.app-key }}
-      APP: ${{ inputs.app }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - id: cached
-        name: Cached app
-        shell: bash
-        run: |
-          entry="e2e-app-$KEY.tar"
-          for tier in "${OUTRUN_CACHE:-}" "${OUTRUN_CACHE_PROTECTED:-}"; do
-            if [ -n "$tier" ] && [ -f "$tier/$entry" ]; then
-              echo "outrun e2e: the app $KEY is cached ($tier)"
-              cp "$tier/$entry" "$RUNNER_TEMP/app.tar"
-              if [ "$tier" = "${OUTRUN_CACHE_PROTECTED:-}" ] && [ -n "${OUTRUN_CACHE:-}" ]; then
-                mkdir -p "$OUTRUN_CACHE/.outrun-used" && touch "$OUTRUN_CACHE/.outrun-used/$entry"
-              fi
-              echo "hit=true" >>"$GITHUB_OUTPUT"
-              exit 0
-            fi
-          done
-          echo "hit=false" >>"$GITHUB_OUTPUT"
-      - if: steps.cached.outputs.hit != 'true'
-        uses: arkadia-so/outrun@v1.3.0 # this release's own action: package.json's version (release.test.ts)
-      - if: steps.cached.outputs.hit != 'true'
-        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
-        with:
-          node-version: ${{ inputs.node-version }}
-      - if: steps.cached.outputs.hit != 'true' && inputs.bun-version != ''
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: ${{ inputs.bun-version }}
-      - if: steps.cached.outputs.hit != 'true'
-        name: Environment
+      # The app, once per run, here rather than in a job of its own (one pickup less): from the
+      # fleet's tiers when its key was built before, else built after restoring the build's own cache
+      # folders, then saved into this job's tier with them; given to the shards as an artifact too (a
+      # shard on another machine may not have the tier's copy yet).
+      - id: build
+        if: inputs.build != '' && (steps.plan.outputs.runners || steps.listed.outputs.runners) != '0' && steps.cached.outputs.hit != 'true'
+        name: Build cache
         shell: bash
         env:
-          VARIABLES: ${{ inputs.env }}
-          NAMES: ${{ inputs.env-secrets }}
-          SECRETS: ${{ toJSON(secrets) }}
-        run: outrun e2e-env >>"$GITHUB_ENV"
-      - if: steps.cached.outputs.hit != 'true'
-        name: Install
-        shell: bash
-        run: ${{ inputs.install }}
-      - if: steps.cached.outputs.hit != 'true'
+          ENTRY: ${{ steps.app.outputs.cache }}
+          CACHE: ${{ inputs.build-cache }}
+        run: |
+          [ -n "$ENTRY" ] || exit 0
+          outrun tier restore "$ENTRY" "$RUNNER_TEMP/build-cache.tar"
+          if [ -f "$RUNNER_TEMP/build-cache.tar" ]; then
+            tar -xf "$RUNNER_TEMP/build-cache.tar" && rm "$RUNNER_TEMP/build-cache.tar"
+            echo "outrun e2e: the build's cache restored: $CACHE"
+          fi
+      - if: steps.build.outcome == 'success'
         name: Build
         shell: bash
         run: ${{ inputs.build }}
-      - if: steps.cached.outputs.hit != 'true'
+      - if: steps.build.outcome == 'success'
         name: Save
         shell: bash
+        env:
+          ENTRY: ${{ steps.app.outputs.cache }}
+          CACHE: ${{ inputs.build-cache }}
         run: |
           [ -e "$APP" ] || { echo "outrun e2e: the build made no $APP (the app input)" >&2; exit 1; }
           tar -C "$(dirname "$APP")" -cf "$RUNNER_TEMP/app.tar" "$(basename "$APP")"
-          if [ -n "${OUTRUN_CACHE:-}" ]; then
-            entry="e2e-app-$KEY.tar"
-            cp "$RUNNER_TEMP/app.tar" "$OUTRUN_CACHE/.$entry.tmp" && mv "$OUTRUN_CACHE/.$entry.tmp" "$OUTRUN_CACHE/$entry"
-          fi
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+          outrun tier save "$RUNNER_TEMP/app.tar" "e2e-app-${{ steps.app.outputs.key }}.tar"
+          [ -n "$ENTRY" ] || exit 0
+          set -f
+          paths=()
+          for path in $CACHE; do [ -e "$path" ] && paths+=("$path"); done
+          [ ${#paths[@]} -gt 0 ] || exit 0
+          tar -cf "$RUNNER_TEMP/build-cache.tar" "${paths[@]}"
+          outrun tier save "$RUNNER_TEMP/build-cache.tar" "$ENTRY"
+      - if: inputs.build != '' && (steps.plan.outputs.runners || steps.listed.outputs.runners) != '0'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: outrun-${{ inputs.name }}-app
           path: ${{ runner.temp }}/app.tar
@@ -243,10 +260,10 @@ jobs:
           compression-level: 0
 
   run:
-    needs: [plan, build]
-    # The build job skipped means no build input (or nothing to run): the shards need no app.
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.runners != '0' && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    needs: plan
+    if: needs.plan.outputs.runners != '0'
     runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     strategy:
       fail-fast: false
@@ -254,7 +271,7 @@ jobs:
         shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: arkadia-so/outrun@v1.3.0 # this release's own action: package.json's version (release.test.ts)
+      - uses: arkadia-so/outrun@v1.4.0 # this release's own action: package.json's version (release.test.ts)
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: ${{ inputs.node-version }}
@@ -284,7 +301,11 @@ jobs:
           VARIABLES: ${{ inputs.env }}
           NAMES: ${{ inputs.env-secrets }}
           SECRETS: ${{ toJSON(secrets) }}
-        run: outrun e2e-env >>"$GITHUB_ENV"
+          FILTER: ${{ inputs.filter }}
+        run: |
+          outrun e2e-env >>"$GITHUB_ENV"
+          case "$FILTER" in *$'\n'*) echo "outrun e2e: the filter input is one line" >&2; exit 1 ;; esac
+          echo "OUTRUN_E2E_FILTER=$FILTER" >>"$GITHUB_ENV"
       - name: Install
         shell: bash
         run: ${{ inputs.install }}
@@ -304,15 +325,8 @@ jobs:
           KEY: ${{ needs.plan.outputs.app-key }}
         run: |
           echo "OUTRUN_E2E_APP=$KEY" >>"$GITHUB_ENV"
-          entry="e2e-app-$KEY.tar"
-          for tier in "${OUTRUN_CACHE:-}" "${OUTRUN_CACHE_PROTECTED:-}"; do
-            if [ -n "$tier" ] && [ -f "$tier/$entry" ]; then
-              mkdir -p "$RUNNER_TEMP/app" && cp "$tier/$entry" "$RUNNER_TEMP/app/app.tar"
-              echo "hit=true" >>"$GITHUB_OUTPUT"
-              exit 0
-            fi
-          done
-          echo "hit=false" >>"$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/app"
+          outrun tier restore "e2e-app-$KEY.tar" "$RUNNER_TEMP/app/app.tar"
       - if: inputs.build != '' && steps.app.outputs.hit != 'true'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -345,16 +359,10 @@ jobs:
           key=$({ jq -r .version "$driver"; xcodebuild -version; sw_vers -productVersion; uname -m; } | shasum -a 256 | cut -c1-32)
           entry="e2e-ios-runner-$key.tar"
           echo "entry=$entry" >>"$GITHUB_OUTPUT"
-          for tier in "${OUTRUN_CACHE:-}" "${OUTRUN_CACHE_PROTECTED:-}"; do
-            if [ -n "$tier" ] && [ -f "$tier/$entry" ]; then
-              mkdir -p "$HOME/.agent-device/apple-runner" && tar -C "$HOME/.agent-device/apple-runner" -xf "$tier/$entry"
-              [ "$tier" = "${OUTRUN_CACHE_PROTECTED:-}" ] && mkdir -p "$OUTRUN_CACHE/.outrun-used" && touch "$OUTRUN_CACHE/.outrun-used/$entry"
-              echo "outrun e2e: XCTest runner from the cache ($entry)"
-              echo "hit=true" >>"$GITHUB_OUTPUT"
-              exit 0
-            fi
-          done
-          echo "hit=false" >>"$GITHUB_OUTPUT"
+          outrun tier restore "$entry" "$RUNNER_TEMP/runner.tar"
+          if [ -f "$RUNNER_TEMP/runner.tar" ]; then
+            mkdir -p "$HOME/.agent-device/apple-runner" && tar -C "$HOME/.agent-device/apple-runner" -xf "$RUNNER_TEMP/runner.tar"
+          fi
       - name: e2e
         shell: bash
         env:
@@ -369,16 +377,28 @@ jobs:
         env:
           ENTRY: ${{ steps.runner.outputs.entry }}
         run: |
-          [ -n "${OUTRUN_CACHE:-}" ] && [ -d "$HOME/.agent-device/apple-runner/derived" ] || exit 0
-          tar -C "$HOME/.agent-device/apple-runner" -cf "$OUTRUN_CACHE/.$ENTRY.tmp" derived
-          mv "$OUTRUN_CACHE/.$ENTRY.tmp" "$OUTRUN_CACHE/$ENTRY"
+          [ -d "$HOME/.agent-device/apple-runner/derived" ] || exit 0
+          tar -C "$HOME/.agent-device/apple-runner" -cf "$RUNNER_TEMP/runner.tar" derived
+          outrun tier save "$RUNNER_TEMP/runner.tar" "$ENTRY"
+      # The batches' reports, gathered from the configs' folders git knows: a `**` glob would walk
+      # node_modules (~12 s on a shard).
+      - if: always()
+        name: Reports
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          git ls-files -z -- '*e2e.config.ts' '*e2e.config.mts' '*e2e.config.js' '*e2e.config.mjs' | while IFS= read -r -d '' config; do
+            dir=$(dirname "$config")
+            for report in "$dir"/.e2e/outrun-*; do
+              [ -d "$report" ] || continue
+              mkdir -p "$RUNNER_TEMP/reports/$dir" && cp -R "$report" "$RUNNER_TEMP/reports/$dir/"
+            done
+          done
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: outrun-${{ inputs.name }}-shard-${{ matrix.shard }}
-          path: "**/.e2e/outrun-*/"
-          # .e2e is a dot folder, which upload-artifact skips unless told.
-          include-hidden-files: true
+          path: ${{ runner.temp }}/reports
           if-no-files-found: ignore
           retention-days: 7
 
@@ -388,7 +408,7 @@ jobs:
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 10
     steps:
-      - uses: arkadia-so/outrun@v1.3.0 # this release's own action: package.json's version (release.test.ts)
+      - uses: arkadia-so/outrun@v1.4.0 # this release's own action: package.json's version (release.test.ts)
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: outrun-${{ inputs.name }}-shard-*

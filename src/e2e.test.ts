@@ -43,21 +43,58 @@ fs.writeFileSync(path.join(out, "junit.xml"), '<?xml version="1.0"?>\\n<testsuit
 process.exit(failed ? 1 : 0);
 `;
 
-const setup = () =>
+// Tests within files: each line `test <name> [@tag] [FAIL]` or `serial <group> <name> ...` declares a
+// test at that line (a serial group's members run together); `list` applies --exclude-tag, `run` takes
+// `file:line` positionals and writes e2e's report.json, one result per test with its line.
+const CLI_TESTS = `
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+const files = fs.readdirSync("e2e").filter((f) => f.endsWith(".e2e.ts")).map((f) => "e2e/" + f).sort();
+const excluded = args.flatMap((a, i) => (a === "--exclude-tag" ? [args[i + 1]] : []));
+const tests = files.flatMap((file) =>
+  fs.readFileSync(file, "utf8").split("\\n").flatMap((text, i) => {
+    const w = text.trim().split(/\\s+/);
+    if (w[0] !== "test" && w[0] !== "serial") return [];
+    const serialId = w[0] === "serial" ? w[1] : undefined;
+    const title = serialId ? w[2] : w[1];
+    const tags = w.filter((x) => x.startsWith("@")).map((x) => x.slice(1));
+    if (tags.some((t) => excluded.includes(t))) return [];
+    return [{ file, title, titlePath: serialId ? [serialId, title] : [title], tags, source: { file, line: i + 1, column: 1 }, ...(serialId ? { serialId } : {}), fail: w.includes("FAIL") }];
+  }),
+);
+if (args[0] === "list") {
+  fs.appendFileSync("lists.log", args.slice(1).join(" ") + "\\n");
+  console.log(JSON.stringify({ pairs: tests.map(({ fail, ...t }) => ({ id: t.file + t.title, kind: "test", ...t })) }));
+  process.exit(0);
+}
+const out = args[args.indexOf("--output") + 1];
+const given = args.filter((a) => /\\.e2e\\.ts:\\d+$/.test(a));
+fs.appendFileSync("runs.log", given.join(" ") + "\\n");
+const at = new Set(given);
+const groups = new Set(tests.filter((t) => t.serialId && at.has(t.file + ":" + t.source.line)).map((t) => t.file + t.serialId));
+const ran = tests.filter((t) => at.has(t.file + ":" + t.source.line) || (t.serialId && groups.has(t.file + t.serialId)));
+const results = ran.map((t) => ({ file: t.file, source: t.source, titlePath: t.titlePath, serialGroupId: t.serialId ? t.file + t.serialId : null, status: t.fail ? "failed" : "passed", attempts: [{ durationMs: 100 }] }));
+fs.mkdirSync(out, { recursive: true });
+fs.writeFileSync(path.join(out, "report.json"), JSON.stringify({ run: { errors: [], results } }));
+fs.writeFileSync(path.join(out, "junit.xml"), '<?xml version="1.0"?>\\n<testsuites name="e2e"></testsuites>\\n');
+process.exit(ran.some((t) => t.fail) ? 1 : 0);
+`;
+
+const setup = (cli = CLI, tests: Record<string, string> = {}) =>
   io(async () => {
     const dir = await mkdtemp(`${tmpdir()}/outrun-e2e-suite-`);
     const bin = await mkdtemp(`${tmpdir()}/outrun-e2e-bin-`);
     await Bun.write(`${bin}/node`, `#!/bin/sh\nexec "${process.execPath}" "$@"\n`);
     await chmod(`${bin}/node`, 0o755);
     const files: Record<string, string> = {
-      ".gitignore": "node_modules/\n.e2e/\nruns.log\n",
+      ".gitignore": "node_modules/\n.e2e/\nruns.log\nlists.log\n",
       "package.json": JSON.stringify({ name: "acme", private: true }),
       "bun.lock": "{}\n",
       "web/e2e.config.ts": "export default { baseURL: process.env.ACME_URL };\n",
-      "web/e2e/home.e2e.ts": "// home\n",
-      "web/e2e/cart.e2e.ts": "// cart\n",
+      ...(cli === CLI ? { "web/e2e/home.e2e.ts": "// home\n", "web/e2e/cart.e2e.ts": "// cart\n" } : tests),
       "web/src/app.ts": "export const app = 1;\n",
-      "node_modules/e2e/dist/cli/bin.js": CLI,
+      "node_modules/e2e/dist/cli/bin.js": cli,
     };
     await Promise.all(Object.entries(files).map(([p, text]) => Bun.write(`${dir}/${p}`, text)));
     git(dir, "init", "-q");
@@ -166,6 +203,77 @@ describe("outrun test --e2e", () => {
         expect((yield* outrunTest(options(s, "a1", { OUTRUN_E2E_APP: "k1" }))).ran).toBe(2);
         expect((yield* outrunTest(options(s, "a2", { OUTRUN_E2E_APP: "k1" }))).replayed).toBe(2);
         expect((yield* outrunTest(options(s, "a3", { OUTRUN_E2E_APP: "k2" }))).ran).toBe(2);
+      }),
+    60_000,
+  );
+});
+
+describe("outrun e2e: a unit per test", () => {
+  const files = {
+    "web/e2e/long.e2e.ts": "test one\ntest two\nserial checkout pay\nserial checkout refund\ntest five @release\n",
+    "web/e2e/cart.e2e.ts": "test cart\n",
+  };
+  const runners = { max: 16, targetMs: 1_000, startMs: 0, slots: 1 };
+
+  it.effect(
+    "makes each test a unit by its line, a serial group one unit at its first line, and spreads one file's tests over runners",
+    () =>
+      Effect.gen(function* () {
+        const s = yield* setup(CLI_TESTS, files);
+        const planned = yield* plan({ ...options(s, "t1"), out: `${s.state}/plan.json`, runners });
+        expect(planned.units.map((u) => u.id).sort()).toEqual([
+          "web/e2e/cart.e2e.ts:1",
+          "web/e2e/long.e2e.ts:1",
+          "web/e2e/long.e2e.ts:2",
+          "web/e2e/long.e2e.ts:3",
+          "web/e2e/long.e2e.ts:5",
+        ]);
+        // Five tests of a minute each (never timed), a target of a second: a runner each.
+        expect(new Set(planned.units.map((u) => u.runner)).size).toBe(5);
+      }),
+    60_000,
+  );
+
+  it.effect(
+    "runs the tests by their lines, fails only the test that failed, and replays the others",
+    () =>
+      Effect.gen(function* () {
+        const s = yield* setup(CLI_TESTS, { ...files, "web/e2e/long.e2e.ts": files["web/e2e/long.e2e.ts"].replace("test two", "test two FAIL") });
+        const first = yield* outrunTest(options(s, "t2"));
+        expect([first.units, first.ran, first.failed]).toEqual([5, 5, ["web/e2e/long.e2e.ts:2"]]);
+        expect(yield* runs(s.dir)).toEqual(["e2e/cart.e2e.ts:1 e2e/long.e2e.ts:1 e2e/long.e2e.ts:2 e2e/long.e2e.ts:3 e2e/long.e2e.ts:5"]);
+        const again = yield* outrunTest(options(s, "t3"));
+        // The failed test runs again; the passes of the same file replay.
+        expect([again.replayed, again.ran, again.failed]).toEqual([4, 1, ["web/e2e/long.e2e.ts:2"]]);
+      }),
+    60_000,
+  );
+
+  it.effect(
+    "applies OUTRUN_E2E_FILTER when listing, keys on it, and refuses what is not a selection flag",
+    () =>
+      Effect.gen(function* () {
+        const s = yield* setup(CLI_TESTS, files);
+        const out = `${s.state}/plan.json`;
+        const all = yield* plan({ ...options(s, "x1"), out, runners });
+        const some = yield* plan({ ...options(s, "x2", { OUTRUN_E2E_FILTER: "--exclude-tag release" }), out, runners });
+        expect(some.units.map((u) => u.id)).not.toContain("web/e2e/long.e2e.ts:5");
+        expect(some.units).toHaveLength(4);
+        // The same test under a filter is another command: another key.
+        const key = (p: typeof all, id: string) => p.units.find((u) => u.id === id)?.key;
+        expect(key(some, "web/e2e/cart.e2e.ts:1")).not.toBe(key(all, "web/e2e/cart.e2e.ts:1"));
+        expect((yield* io(() => Bun.file(`${s.dir}/web/lists.log`).text())).trim().split("\n")).toContain(
+          "--reporter json --config e2e.config.ts --exclude-tag release --pass-with-no-tests",
+        );
+        // The shards run with the filter too, given only the selected tests.
+        const ran = yield* outrunTest(options(s, "x3", { OUTRUN_E2E_FILTER: "--exclude-tag=release" }));
+        expect(ran.ran).toBe(4);
+        // Each test's own duration (100 ms in the report) is learned: a second's target now fits them on one runner.
+        yield* io(() => Bun.write(`${s.dir}/web/src/app.ts`, "export const app = 4;\n"));
+        const timed = yield* plan({ ...options(s, "x3b", { OUTRUN_E2E_FILTER: "--exclude-tag release" }), out, runners });
+        expect(new Set(timed.units.map((u) => u.runner)).size).toBe(1);
+        const refused = yield* Effect.flip(plan({ ...options(s, "x4", { OUTRUN_E2E_FILTER: "--retries 3" }), out, runners }));
+        expect(refused.message).toContain("OUTRUN_E2E_FILTER");
       }),
     60_000,
   );

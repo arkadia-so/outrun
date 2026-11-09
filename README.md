@@ -166,9 +166,14 @@ A repository on Bazel keeps Bazel the same way. `outrun bazel-cache --port 7071`
 ## End-to-end tests
 
 `--e2e` runs a repository's [TesterArmy e2e](https://www.npmjs.com/package/e2e) suites with no
-`outrun.json`: every `e2e.config.{ts,mts,js,mjs}` git knows is a suite, and each test file its CLI
-lists (`e2e list --reporter json`) is a unit. A runner's share of a suite runs as one `e2e run`
-with the config's own workers; a file's verdict is its JUnit testsuite.
+`outrun.json`: every `e2e.config.{ts,mts,js,mjs}` git knows is a suite, and each test its CLI lists
+(`e2e list --reporter json`) is a unit, named by the line it is declared at (`e2e/checkout.e2e.ts:12`):
+one file's tests spread over several runners, so the wall is bounded by the longest test, not the
+longest file. A serial group is one unit (at its first test's line, which runs the whole group), and
+tests declared on one line (a loop) are one unit. A runner's share of a suite runs as one `e2e run`
+given those `file:line`s, with the config's own workers; each test's verdict and duration come from
+e2e's `report.json`. Durations are learned per test, by its title path, so a test that moves within
+its file keeps its time; its key is still its whole file's (content and import closure).
 
 ```sh
 outrun plan --e2e --out plan.json   # defaults for e2e: --target 300 --start 60 --max-runners 16 --slots 1
@@ -182,6 +187,11 @@ variable the folder reads by name (`process.env.ACME_URL`): another deployment i
 test. A pass replays for 24 hours, since the app may change without a commit. The tests get the
 job's whole environment, and a red file is not run again alone (the config's `retries` decide).
 `--only <path>` keeps the configs whose folder holds or lies under the path.
+
+`OUTRUN_E2E_FILTER` selects tests with e2e's own flags (`--tag`, `--tag-mode`, `--exclude-tag`,
+`--grep`, `--grep-invert`, `--target`; anything else is refused): applied when a config is listed,
+so a test it leaves out is no unit and takes no runner, and passed to every `e2e run`, so it is in
+each unit's key and in the listing's. A config left empty by the filter is no error.
 
 A config's listing is kept (on the machine and in the remote cache) under the key of what can
 change it: its folder's paths, the content of its test files (named `*.e2e.*`, `*.test.*`,
@@ -208,8 +218,15 @@ jobs:
       setup: npx playwright install --with-deps chromium
       env: ACME_URL=https://staging.acme.example
       env-secrets: ACME_MODEL_TOKEN        # secrets the tests read, by name
+      filter: --exclude-tag release        # e2e's selection flags (OUTRUN_E2E_FILTER)
+      environment: e2e                     # the GitHub environment of the jobs that run tests
     secrets: inherit
 ```
+
+`environment` puts the plan job (which builds the app) and the shards in that GitHub environment:
+its secrets reach `secrets: inherit`, and their OIDC tokens carry its subject
+(`repo:<owner>/<repo>:environment:<name>`), so a cloud trust that accepts only that environment
+works unchanged. outrun's verdict cache trusts only the token's repository, whatever its subject.
 
 The plan job installs nothing when every config's listing is kept. On `outrun-macos`, the app is
 built once and each shard installs it on a simulator:
@@ -220,13 +237,18 @@ built once and each shard installs it on a simulator:
       install: npm ci
       build: ./scripts/build-simulator-app.sh   # once per run, after install
       build-inputs: ios/** package-lock.json    # its key, with the command and the image
+      build-cache: build/ios ios/Pods           # the build's own cache folders, back before a build
       app: build/Acme.app                       # given to each shard at this path
       simulator: iPhone                         # booted when none is (the newest runtime's)
 ```
 
-The build job takes the app from the fleet's cache tiers when its key was built before (`$OUTRUN_CACHE`,
-then `$OUTRUN_CACHE_PROTECTED`, written by the default branch's runs), else builds it and saves it into
-the job's tier; the shards get it from the tier or as the run's artifact. A shard boots its simulator first, so it
+The plan job takes the app from the fleet's cache tiers when its key was built before (`$OUTRUN_CACHE`,
+then `$OUTRUN_CACHE_PROTECTED`, written by the default branch's runs), else builds it there (no job of
+its own, so no pickup of its own) and saves it into the job's tier; the shards get it from the tier or
+as the run's artifact. Before a build, the `build-cache` folders come back from the tiers as the last
+build on this machine left them (one entry per build command, machine and folders, never per key), and
+they are saved again after it, so a new key builds incrementally. `outrun tier restore <entry> <file>`
+and `outrun tier save <file> <entry>` are those moves, usable in any step. A shard boots its simulator first, so it
 boots while the job installs, then installs an iOS `.app` on every booted simulator, so a config that
 names no `device` runs on it. The XCTest runner e2e's iOS driver builds on its first run is kept in
 the tiers too, keyed on the driver's version and Xcode's. The build is

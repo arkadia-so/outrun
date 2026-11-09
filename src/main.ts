@@ -12,7 +12,10 @@ import { appendFile } from "node:fs/promises";
 //                                the command unit's step passed: write its pass
 //   outrun units [--json]        every unit, its key and how many files its key holds
 //   --e2e (plan, test, units)    no outrun.json: the checkout's TesterArmy e2e configs are the suites
-//   outrun e2e-app-key --build <cmd> --inputs <glob>...   the key of an app the e2e workflow builds once
+//   outrun e2e-app-key --build <cmd> --inputs <glob>... [--cache <path>]...
+//                                the key of an app the e2e workflow builds once (and its build cache's entry)
+//   outrun tier restore <entry> <file> | outrun tier save <file> <entry>
+//                                a file from or into the job's cache tiers ($OUTRUN_CACHE, $OUTRUN_CACHE_PROTECTED)
 //   outrun junit-merge --out f <reports...>
 //                                one JUnit report from several (a run's shards)
 //   outrun xcode-reads --trace-dir d --build unit [--run unit]... --out file
@@ -36,13 +39,14 @@ import pkg from "../package.json" with { type: "json" };
 import { BAZEL, buildCacheApp, NX } from "./build-cache.ts";
 import { githubOidc } from "./cache.ts";
 import { checkCommand } from "./check.ts";
-import { appKey } from "./discover.ts";
+import { appKey, buildCacheEntry } from "./discover.ts";
 import { e2eEnvLines } from "./e2e-env.ts";
 import { blocking, keyUnits, lookupCommand, plan, planCached, recordCommand, test } from "./engine.ts";
 import { CacheUnavailable, FileFailed, TestsFailed, UsageInvalid } from "./errors.ts";
 import * as Git from "./git.ts";
 import { mergeJunit, parseJunit } from "./junit.ts";
 import { machineFingerprint } from "./machine.ts";
+import { restoreEntry, saveEntry } from "./tier.ts";
 import type { Remote } from "./upstream.ts";
 import { xcodeReads } from "./xcode-reads.ts";
 
@@ -347,19 +351,56 @@ const e2eAppKeyCommand = Command.make(
       Flag.withDescription("a glob of the files the build reads, from the root; `!glob` excludes (repeatable)"),
       Flag.atLeast(1),
     ),
+    cache: Flag.String("cache").pipe(
+      Flag.withDescription("a folder the build keeps its own cache in, from the root (repeatable): writes `cache=<entry>`, its tier entry"),
+      Flag.atLeast(0),
+    ),
   },
   (flags) =>
     Effect.gen(function* () {
       const repo = yield* Git.root(process.cwd());
       const blobs = yield* Git.blobs(repo);
-      const key = appKey(blobs, flags.build, flags.inputs, machineFingerprint(env, []));
-      const output = env.GITHUB_OUTPUT;
-      if (output)
-        yield* Effect.tryPromise({ try: () => appendFile(output, `key=${key}\n`), catch: () => new FileFailed({ message: `${output}: not writable` }) });
+      const machine = machineFingerprint(env, []);
+      const key = appKey(blobs, flags.build, flags.inputs, machine);
+      const lines = [`key=${key}`, ...(flags.cache.length > 0 ? [`cache=${buildCacheEntry(flags.build, flags.cache, machine)}`] : [])];
+      yield* toOutput(lines);
       yield* Console.log(key);
     }),
 ).pipe(
-  Command.withDescription("The key of an app built once per e2e run (its build command, the machine, its inputs' content): the cache's key and OUTRUN_E2E_APP"),
+  Command.withDescription(
+    "The key of an app built once per e2e run (its build command, the machine, its inputs' content): the cache's key and OUTRUN_E2E_APP; with --cache, its build cache's entry",
+  ),
+);
+
+/** Appends `name=value` lines to the step's outputs ($GITHUB_OUTPUT), when there is one. */
+const toOutput = (lines: readonly string[]) =>
+  Effect.gen(function* () {
+    const output = env.GITHUB_OUTPUT;
+    if (!output) return;
+    yield* Effect.tryPromise({
+      try: () => appendFile(output, lines.map((l) => `${l}\n`).join("")),
+      catch: () => new FileFailed({ message: `${output}: not writable` }),
+    });
+  });
+
+const tierRestoreCommand = Command.make("restore", { entry: Argument.String("entry"), file: Argument.String("file") }, (args) =>
+  Effect.gen(function* () {
+    const from = yield* restoreEntry(env, args.entry, args.file);
+    yield* toOutput([`hit=${from !== undefined}`]);
+    yield* Console.error(from ? `outrun: ${args.entry} from the ${from === "own" ? "job's" : "protected"} tier` : `outrun: ${args.entry} is in no tier`);
+  }),
+).pipe(Command.withDescription("Copies an entry of the job's cache tiers to a file (the job's own, then the protected); writes hit=true|false"));
+
+const tierSaveCommand = Command.make("save", { file: Argument.String("file"), entry: Argument.String("entry") }, (args) =>
+  Effect.gen(function* () {
+    const saved = yield* saveEntry(env, args.file, args.entry);
+    yield* Console.error(saved ? `outrun: ${args.entry} saved into the job's tier` : `outrun: no cache tier on this runner; ${args.entry} not saved`);
+  }),
+).pipe(Command.withDescription("Saves a file as an entry of the job's own cache tier, promoted to the tier after the job"));
+
+const tierCommand = Command.make("tier").pipe(
+  Command.withDescription("Files in the job's cache tiers on outrun's Mac runners ($OUTRUN_CACHE, $OUTRUN_CACHE_PROTECTED)"),
+  Command.withSubcommands([tierRestoreCommand, tierSaveCommand]),
 );
 
 const outrun = Command.make("outrun").pipe(
@@ -376,6 +417,7 @@ const outrun = Command.make("outrun").pipe(
     junitMergeCommand,
     e2eEnvCommand,
     e2eAppKeyCommand,
+    tierCommand,
     checkCommand,
   ]),
 );

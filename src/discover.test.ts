@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { appKey, e2eConfigs, envNames, keptFiles, listedFiles } from "./discover.ts";
+import { appKey, e2eConfigs, envNames, keptTests, listedTests, parseFilter } from "./discover.ts";
+import { ConfigInvalid } from "./errors.ts";
 
 describe("e2e discovery", () => {
   it("finds every e2e config outside node_modules", () => {
@@ -21,9 +22,47 @@ describe("e2e discovery", () => {
     expect(envNames(text).sort()).toEqual(["ACME_TOKEN", "ACME_URL", "VITE_X"]);
   });
 
-  it("takes each listed file once", () => {
-    const json = JSON.stringify({ pairs: [{ file: "e2e/b.e2e.ts" }, { file: "e2e/a.e2e.ts" }, { file: "e2e/b.e2e.ts" }, { title: "no file" }] });
-    expect(listedFiles(json)).toEqual(["e2e/a.e2e.ts", "e2e/b.e2e.ts"]);
+  it("makes a unit of each declaring line, a serial group one unit at its first line, and a file with no lines one unit", () => {
+    const pair = (file: string, line: number | undefined, titlePath: string[], serialId?: string) => ({
+      file,
+      title: titlePath.at(-1),
+      titlePath,
+      ...(line === undefined ? {} : { source: { file, line, column: 1 } }),
+      ...(serialId ? { serialId } : {}),
+    });
+    const json = JSON.stringify({
+      pairs: [
+        pair("e2e/b.e2e.ts", 9, ["refund"], undefined),
+        pair("e2e/b.e2e.ts", 4, ["checkout", "pay"], "g1"),
+        pair("e2e/b.e2e.ts", 6, ["checkout", "confirm"], "g1"),
+        pair("e2e/b.e2e.ts", 9, ["refund"], undefined),
+        pair("e2e/a.e2e.ts", 2, ["loop 1"]),
+        pair("e2e/a.e2e.ts", 2, ["loop 2"]),
+        pair("e2e/c.e2e.ts", undefined, ["old cli"]),
+        { title: "no file" },
+      ],
+    });
+    expect(listedTests(json)).toEqual([
+      { file: "e2e/a.e2e.ts", line: 2, name: "loop 1" },
+      { file: "e2e/b.e2e.ts", line: 4, name: "checkout" },
+      { file: "e2e/b.e2e.ts", line: 9, name: "refund" },
+      { file: "e2e/c.e2e.ts", name: "e2e/c.e2e.ts" },
+    ]);
+  });
+
+  it("takes e2e's selection flags as the filter, and refuses anything else", () => {
+    expect(parseFilter(undefined)).toEqual([]);
+    expect(parseFilter("--exclude-tag release --exclude-tag=push --grep 'pays by card'")).toEqual([
+      "--exclude-tag",
+      "release",
+      "--exclude-tag",
+      "push",
+      "--grep",
+      "pays by card",
+    ]);
+    expect(parseFilter("--retries 3")).toBeInstanceOf(ConfigInvalid);
+    expect(parseFilter("--tag")).toBeInstanceOf(ConfigInvalid);
+    expect(parseFilter("smoke")).toBeInstanceOf(ConfigInvalid);
   });
 
   it("keys a built app on its build command, its machine and its inputs' content, nothing else", () => {
@@ -41,9 +80,12 @@ describe("e2e discovery", () => {
   });
 
   it("reads a kept listing only in its own format", () => {
-    expect(keptFiles(JSON.stringify({ v: 1, files: ["e2e/a.e2e.ts"] }))).toEqual(["e2e/a.e2e.ts"]);
-    expect(keptFiles(JSON.stringify({ v: 2, files: [] }))).toBeUndefined();
-    expect(keptFiles("{")).toBeUndefined();
-    expect(keptFiles(undefined)).toBeUndefined();
+    const tests = [{ file: "e2e/a.e2e.ts", line: 3, name: "pays" }];
+    expect(keptTests(JSON.stringify({ v: 2, tests }))).toEqual(tests);
+    // A listing kept by an older release (files, not tests) is listed again.
+    expect(keptTests(JSON.stringify({ v: 1, files: ["e2e/a.e2e.ts"] }))).toBeUndefined();
+    expect(keptTests(JSON.stringify({ v: 2, tests: [{ file: "e2e/a.e2e.ts", line: 0, name: "x" }] }))).toBeUndefined();
+    expect(keptTests("{")).toBeUndefined();
+    expect(keptTests(undefined)).toBeUndefined();
   });
 });

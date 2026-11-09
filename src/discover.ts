@@ -1,8 +1,16 @@
 // `--e2e`: the configuration outrun builds itself from a repository's TesterArmy e2e configs, with no
 // outrun.json (DESIGN.md §13). Every `e2e.config.{ts,mts,js,mjs}` git knows is a suite: its folder is
-// the suite's, its test files are the ones TesterArmy's own CLI lists for it (`e2e list --reporter
-// json`, so a config's `tests` glob and filters mean what they mean to `e2e run`), and a batch is
-// `e2e run` on the nearest installed CLI, under Node (found at the batch: adapters/e2e.ts).
+// the suite's, its tests are the ones TesterArmy's own CLI lists for it (`e2e list --reporter json`,
+// so a config's `tests` glob and filters mean what they mean to `e2e run`), and a batch is `e2e run`
+// on the nearest installed CLI, under Node (found at the batch: adapters/e2e.ts).
+//
+// A unit is one test, named `file:line` by the line e2e's listing declares it at, which `e2e run`
+// selects as a positional (DESIGN.md §13.7): a file of long tests spreads over several runners. A
+// serial group (`describe(..., { serial: true })`) runs in order on one worker and retries as a whole,
+// so it stays one unit, at its first member's line (which selects the whole group). Tests declared on
+// one line (a loop) are one unit. OUTRUN_E2E_FILTER holds e2e's own selection flags (`--tag`,
+// `--exclude-tag`, `--tag-mode`, `--grep`, `--grep-invert`, `--target`): the listing applies them, so
+// a test they leave out is no unit, and they join the listing's key and every unit's command.
 //
 // What a discovered suite's keys hold: every file of the config's folder (a config in the app's
 // package reruns its tests when the app changes), the test files' import closures, the lockfiles, and
@@ -45,6 +53,87 @@ const CLI = "node_modules/e2e/dist/cli/bin.js";
 const TEST_NAME = /(^|\/)(e2e|tests?)\/|\.(e2e|test|spec)\.[^/]*$/;
 /** The variable the workflow names its built app's key in (e2e.yml `build`): every discovered suite is keyed on it. */
 const APP_ENV = "OUTRUN_E2E_APP";
+/** The variable holding e2e's selection flags (e2e.yml `filter`). */
+const FILTER_ENV = "OUTRUN_E2E_FILTER";
+/** e2e's selection flags, each followed by its value. */
+const FILTER_FLAGS = new Set(["--tag", "--tag-mode", "--exclude-tag", "--grep", "--grep-invert", "--target"]);
+
+/** Pure: shell-like words (single and double quotes group, no expansion). */
+const words = (text: string): string[] => {
+  const out: string[] = [];
+  for (const m of text.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)) out.push(m[1] ?? m[2] ?? m[3] ?? "");
+  return out;
+};
+
+/**
+ * Pure: e2e's selection flags from OUTRUN_E2E_FILTER's value, as `--flag value` pairs (`--flag=value`
+ * taken too); anything else is refused, since it would change what a test does, not which run.
+ */
+export const parseFilter = (text: string | undefined): string[] | ConfigInvalid => {
+  const given = words(text ?? "");
+  const out: string[] = [];
+  for (let i = 0; i < given.length; i++) {
+    const word = given[i] as string;
+    const eq = word.indexOf("=");
+    const [flag, value] = eq > 0 ? [word.slice(0, eq), word.slice(eq + 1)] : [word, given[++i]];
+    if (!FILTER_FLAGS.has(flag) || value === undefined || value === "")
+      return new ConfigInvalid({
+        message: `${FILTER_ENV}: "${word}" is not one of e2e's selection flags with its value (${[...FILTER_FLAGS].join(", ")})`,
+      });
+    out.push(flag, value);
+  }
+  return out;
+};
+
+/** One unit of a listing: a test or a serial group, by the line `e2e run` selects it at (none: the whole file). */
+export interface ListedTest {
+  readonly file: string;
+  readonly line?: number;
+  /** Its title path (a serial group's: the group's), stable across edits that move lines: its timing's name. */
+  readonly name: string;
+}
+
+interface Pair {
+  readonly file?: unknown;
+  readonly titlePath?: unknown;
+  readonly title?: unknown;
+  readonly serialId?: unknown;
+  readonly source?: { readonly line?: unknown };
+}
+
+const titleOf = (p: Pair): string[] =>
+  Array.isArray(p.titlePath) && p.titlePath.every((t) => typeof t === "string") ? (p.titlePath as string[]) : typeof p.title === "string" ? [p.title] : [];
+
+/**
+ * Pure: the units of `e2e list --reporter json`'s answer, sorted by file and line: one per declaring
+ * line, a serial group's members folded into the group at its first line, and a file whose tests
+ * carry no line one unit of its own.
+ */
+export const listedTests = (json: string): ListedTest[] => {
+  const parsed = JSON.parse(json) as { pairs?: readonly Pair[] };
+  const pairs = (parsed.pairs ?? []).filter((p): p is Pair & { file: string } => typeof p.file === "string");
+  const lineOf = (p: Pair) => (typeof p.source?.line === "number" && p.source.line > 0 ? p.source.line : undefined);
+  const groups = new Map<string, { line: number; name: string }>();
+  for (const p of pairs) {
+    const line = lineOf(p);
+    if (typeof p.serialId !== "string" || line === undefined) continue;
+    const id = `${p.file}\0${p.serialId}`;
+    const at = groups.get(id);
+    if (!at || line < at.line) groups.set(id, { line, name: titleOf(p).slice(0, -1).join(" › ") || titleOf(p).join(" › ") });
+  }
+  const units = new Map<string, ListedTest>();
+  for (const p of pairs) {
+    if (pairs.some((q) => q.file === p.file && lineOf(q) === undefined)) {
+      units.set(p.file, { file: p.file, name: p.file });
+      continue;
+    }
+    const group = typeof p.serialId === "string" ? groups.get(`${p.file}\0${p.serialId}`) : undefined;
+    const line = group?.line ?? (lineOf(p) as number);
+    const id = `${p.file}:${line}`;
+    if (!units.has(id)) units.set(id, { file: p.file, line, name: group?.name ?? titleOf(p).join(" › ") });
+  }
+  return [...units.values()].sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : (a.line ?? 0) - (b.line ?? 0)));
+};
 
 /**
  * Pure: the e2e configs of the checkout (repository-relative), outside any node_modules; with `only`
@@ -68,12 +157,6 @@ export const envNames = (text: string): string[] => {
   return [...names];
 };
 
-/** Pure: the test files of `e2e list --reporter json`'s answer, relative to the config's folder. */
-export const listedFiles = (json: string): string[] => {
-  const parsed = JSON.parse(json) as { pairs?: readonly { file?: unknown }[] };
-  return [...new Set((parsed.pairs ?? []).flatMap((p) => (typeof p.file === "string" ? [p.file] : [])))].sort();
-};
-
 /** The nearest installed CLI from the config's folder up to the repository's root, relative to that folder. */
 export const nearestCli = (repo: string, dir: string): string | undefined => {
   const parts = dir === "." ? [] : dir.split("/");
@@ -93,10 +176,12 @@ const readText = (path: string) => {
   }
 };
 
-const list = (cwd: string, cli: string, config: string, env: Env) =>
+const list = (cwd: string, cli: string, config: string, filter: readonly string[], env: Env) =>
   Effect.tryPromise({
     try: async () => {
-      const child = Bun.spawn(["node", cli, "list", "--reporter", "json", "--config", config], {
+      // A filter may leave a config with no test: no unit, not an error.
+      const select = filter.length > 0 ? [...filter, "--pass-with-no-tests"] : [];
+      const child = Bun.spawn(["node", cli, "list", "--reporter", "json", "--config", config, ...select], {
         cwd,
         env: env as Record<string, string>,
         stdout: "pipe",
@@ -104,7 +189,7 @@ const list = (cwd: string, cli: string, config: string, env: Env) =>
       });
       const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
       if (code !== 0) throw new Error((err.trim() || out.trim()).split("\n").slice(-5).join("\n") || `exit ${code}`);
-      return listedFiles(out);
+      return listedTests(out);
     },
     catch: (error) => new ConfigInvalid({ message: `e2e list in ${cwd}: ${error instanceof Error ? error.message : String(error)}` }),
   });
@@ -117,6 +202,14 @@ const list = (cwd: string, cli: string, config: string, env: Env) =>
  */
 export const appKey = (blobs: Blobs, build: string, inputs: readonly string[], machine: string) =>
   sha256(JSON.stringify(["outrun-e2e-app-1", build, machine, blobsOf(blobs, matching(blobs, ".", inputs))]));
+
+/**
+ * Pure: the tier entry of a build's own cache folders (e2e.yml `build-cache`): its build command, the
+ * machine and the folders, never the sources' content, so a build whose key missed restores what the
+ * last build on this machine left (an incremental build), and saves it again after.
+ */
+export const buildCacheEntry = (build: string, paths: readonly string[], machine: string) =>
+  `e2e-build-cache-${sha256(JSON.stringify(["outrun-e2e-build-cache-1", build, machine, [...paths].sort()])).slice(0, 32)}.tar`;
 
 /** Where listings are kept, and whether the CLI may be run for one that is not. */
 export interface Listings {
@@ -135,18 +228,25 @@ const listingKey = (input: {
   readonly closure: readonly (readonly [string, string])[];
   readonly lockfiles: readonly (readonly [string, string])[];
   readonly env: readonly (readonly [string, string])[];
-}) => sha256(JSON.stringify(["outrun-e2e-listing-1", input.path, input.paths, input.tests, input.closure, input.lockfiles, input.env]));
+  readonly filter: readonly string[];
+}) => sha256(JSON.stringify(["outrun-e2e-listing-2", input.path, input.paths, input.tests, input.closure, input.lockfiles, input.env, input.filter]));
 
 const sha256 = (text: string) => new Bun.CryptoHasher("sha256").update(text).digest("hex");
 
 const blobsOf = (blobs: Blobs, files: Iterable<string>) => [...new Set(files)].sort().map((f) => [f, blobs.get(f) ?? "missing"] as const);
 
-/** Pure: a kept listing's files, or undefined for anything else. */
-export const keptFiles = (text: string | undefined): string[] | undefined => {
+const isListed = (t: unknown): t is ListedTest => {
+  if (!t || typeof t !== "object") return false;
+  const { file, line, name } = t as Record<string, unknown>;
+  return typeof file === "string" && typeof name === "string" && (line === undefined || (typeof line === "number" && line > 0));
+};
+
+/** Pure: a kept listing's tests, or undefined for anything else (an older format is listed again). */
+export const keptTests = (text: string | undefined): ListedTest[] | undefined => {
   if (text === undefined) return undefined;
   try {
-    const parsed = JSON.parse(text) as { v?: unknown; files?: unknown };
-    return parsed.v === 1 && Array.isArray(parsed.files) && parsed.files.every((f) => typeof f === "string") ? (parsed.files as string[]) : undefined;
+    const parsed = JSON.parse(text) as { v?: unknown; tests?: unknown };
+    return parsed.v === 2 && Array.isArray(parsed.tests) && parsed.tests.every(isListed) ? (parsed.tests as ListedTest[]) : undefined;
   } catch {
     return undefined;
   }
@@ -155,7 +255,7 @@ export const keptFiles = (text: string | undefined): string[] | undefined => {
 const readKept = (listings: Listings, key: string) =>
   Effect.gen(function* () {
     const path = `${listings.state}/listings/${key}.json`;
-    const local = keptFiles(
+    const local = keptTests(
       yield* Effect.tryPromise({
         try: async () => ((await Bun.file(path).exists()) ? await Bun.file(path).text() : undefined),
         catch: () => new FileFailed({ message: `${path}: not readable` }),
@@ -164,16 +264,16 @@ const readKept = (listings: Listings, key: string) =>
         Effect.catchTag("FileFailed", () => Effect.succeed(undefined)),
       ),
     );
-    if (local) return { files: local, from: "local" } as const;
+    if (local) return { tests: local, from: "local" } as const;
     if (!listings.remote) return undefined;
     // A kept listing the cache cannot give only costs the CLI's run.
-    const remote = keptFiles(yield* get(listings.remote, key).pipe(Effect.catchTag("CacheUnavailable", () => Effect.succeed(undefined))));
-    return remote ? ({ files: remote, from: "remote" } as const) : undefined;
+    const remote = keptTests(yield* get(listings.remote, key).pipe(Effect.catchTag("CacheUnavailable", () => Effect.succeed(undefined))));
+    return remote ? ({ tests: remote, from: "remote" } as const) : undefined;
   });
 
-const keep = (listings: Listings, key: string, files: readonly string[], fromRemote: boolean) =>
+const keep = (listings: Listings, key: string, tests: readonly ListedTest[], fromRemote: boolean) =>
   Effect.gen(function* () {
-    const body = JSON.stringify({ v: 1, files });
+    const body = JSON.stringify({ v: 2, tests });
     const path = `${listings.state}/listings/${key}.json`;
     yield* Effect.tryPromise({
       try: async () => {
@@ -198,6 +298,8 @@ export const discoverE2e = (repo: string, blobs: Blobs, env: Env, listings: List
     const configs = e2eConfigs(blobs.keys(), only);
     if (configs.length === 0)
       return yield* new ConfigInvalid({ message: `--e2e: no e2e.config.ts (or .mts, .js, .mjs) in the checkout${only ? ` under ${only.join(", ")}` : ""}` });
+    const filter = parseFilter(env[FILTER_ENV]);
+    if (filter instanceof ConfigInvalid) return yield* filter;
     const suites = yield* Effect.forEach(
       configs,
       (path) =>
@@ -231,11 +333,12 @@ export const discoverE2e = (repo: string, blobs: Blobs, env: Env, listings: List
               env,
               [...names].filter((n) => n !== APP_ENV),
             ),
+            filter,
           });
           const kept = yield* readKept(listings, key);
-          let tests: readonly string[];
+          let tests: readonly ListedTest[];
           if (kept) {
-            tests = kept.files;
+            tests = kept.tests;
             if (kept.from === "remote") yield* keep(listings, key, tests, true);
           } else if (listings.cachedOnly) return { missing: path } as const;
           else {
@@ -244,23 +347,25 @@ export const discoverE2e = (repo: string, blobs: Blobs, env: Env, listings: List
               return yield* new ConfigInvalid({
                 message: `${path}: TesterArmy's e2e CLI is not installed (no ${CLI} from ${dir} up); install the repository's dependencies first`,
               });
-            tests = yield* list(dir === "." ? repo : `${repo}/${dir}`, cli, base, env);
+            tests = yield* list(dir === "." ? repo : `${repo}/${dir}`, cli, base, filter, env);
             yield* keep(listings, key, tests, false);
           }
           const suite: Suite = {
             name: `e2e:${dir}`,
             adapter: "e2e",
             dir,
-            tests,
+            tests: [...new Set(tests.map((t) => t.file))].sort(),
+            units: tests,
             // `e2e` is the CLI the batch finds installed (adapters/e2e.ts), so the key does not depend
             // on where the install put it, and a plan made before any install keys what its shards run.
-            run: ["e2e", "run", "--config", base, "--reporter", "list"],
+            // The filter is in it too: a serial group's member it leaves out stays out.
+            run: ["e2e", "run", "--config", base, ...filter, "--reporter", "list"],
             sources: ["suite", "imports"],
             hashedEnv: [...names].sort(),
             inheritEnv: true,
             rerunAlone: false,
             maxAgeHours: 24,
-            // A file never timed counts as a minute; a batch is killed after an hour, or 15 minutes silent.
+            // A test never timed counts as a minute; a batch is killed after an hour, or 15 minutes silent.
             defaultMs: 60_000,
             timeoutMs: 3_600_000,
             idleMs: 900_000,
