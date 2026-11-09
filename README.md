@@ -264,6 +264,31 @@ names no `device` runs on it. The XCTest runner e2e's iOS driver builds on its f
 the tiers too, keyed on the driver's version and Xcode's. The build is
 skipped, with the matrix, when every test replays.
 
+### Warm runners with a booted simulator
+
+Without any declaration, a job on outrun waits only for a runner, and a job starts on a runner
+that is already waiting whenever one is free. To have runners waiting for your repository
+before its jobs queue, declare them in your installation's settings, `warmRunners`. Each entry
+is a repository, a label and a count (16 at most). On a macOS label, the entry can also name an
+iOS simulator:
+
+```json
+{ "warmRunners": [{ "repo": "acme/app", "label": "outrun-macos", "count": 16, "simulator": "iPhone 16e" }] }
+```
+
+- **What outrun prepares.** Each warm macOS VM boots the newest runtime's first simulator of that
+  name (made from the device type of that exact name when the image has none). It does this before
+  its runner comes online, for 90 s at most. A job that takes the runner finds the simulator
+  already booted. The workflow's `simulator` step uses booted simulators first, so the job boots
+  nothing. A runner taken by a job is replaced within seconds.
+- **What you gain**, measured on a 16-shard iOS suite (2026-11-09):
+  - queue: 30–67 s before, 2–3 s after;
+  - simulator boot: 14–39 s before, 0 s after;
+  - from a shard's creation to its test engine being ready (app installed, driver prepared):
+    131–265 s before, about 45–80 s after.
+- **To turn it on**, ask outrun to set the entry for your installation (the settings are not on
+  the API yet). Give the same device name as your workflow's `simulator` input.
+
 The repository needs `e2e` in its dependencies, Node on the runner, `.e2e/` git-ignored (outrun
 writes each batch's report under `.e2e/outrun-*`, inside the project root as the CLI requires), and
 the token its config's model needs. The model is the config's; an OpenAI-compatible gateway such as
@@ -316,8 +341,11 @@ OUTRUN_API_TOKEN=ort_... OUTRUN_INSTALLATION=<id> OUTRUN_GITHUB_TOKEN=<a token t
 ```
 
 Exit 0: every unit passed; 1: one failed (its log printed); 3: outrun did not run it (unreachable,
-no warm checkout yet, no VM free): run the check locally instead. The repository must be listed in
-the installation's check settings.
+no warm checkout yet, no VM free, a worker lost, or past its time): run the check locally instead.
+Its time (since 1.7): the plan's expected time (the slowest shard's, from the units' last runs) plus
+30 s once the shards are sent; a worker that stops answering is lost within seconds. It prints how
+many workers it got of those asked. The repository must be listed in the installation's check
+settings.
 
 ## License
 

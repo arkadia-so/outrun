@@ -30,6 +30,9 @@ const fake = (opts: {
   message?: string;
   durations?: Record<string, number>;
   shas?: string[];
+  // The shards a dead VM leaves unfinished (code -1), and whether the shards never answer.
+  crash?: number[];
+  silent?: boolean;
 }) => {
   const calls: string[] = [];
   const events: CheckEvent[] = [];
@@ -62,18 +65,25 @@ const fake = (opts: {
     shards: (_id, shards) =>
       Effect.sync(() => {
         calls.push(`shards ${JSON.stringify(shards)}`);
+        if (opts.silent) return;
         for (const shard of shards) {
           const failed = opts.fail?.includes(shard.worker) ?? false;
+          const crashed = opts.crash?.includes(shard.worker) ?? false;
           push({
             worker: names[shard.worker]!,
             step: "shard",
-            code: failed ? 1 : 0,
+            code: crashed ? -1 : failed ? 1 : 0,
             log: failed ? `${shard.tasks[0]}: expected 1, got 2` : "",
             json: { tasks: shard.tasks.map((id, i) => ({ id, ms: 1000, cache: "MISS", exit: failed && i === 0 ? 1 : 0 })) },
           });
         }
       }),
-    events: (_id, after) => Effect.sync(() => events.filter((e) => e.seq > after)),
+    // A long poll: waits for an event (here, forever when there is none).
+    events: (_id, after) =>
+      Effect.suspend(() => {
+        const later = events.filter((e) => e.seq > after);
+        return later.length > 0 ? Effect.succeed(later) : Effect.never;
+      }),
     end: (id) => Effect.sync(() => void calls.push(`end ${id}`)),
   });
   const repo = Layer.succeed(Repo, {
@@ -224,6 +234,43 @@ describe("outrun check", () => {
       const b = yield* Effect.flip(runRepoCheck(2).pipe(Effect.provide(lost.layer)));
       expect(b).toMatchObject({ _tag: "NotRun", message: "worker chk-c-1 was lost: mm2 left the fleet" });
       expect(lost.calls.at(-1)).toBe("end c");
+    }),
+  );
+
+  it.effect("says how many workers it got of those asked, and is not run with none", () =>
+    Effect.gen(function* () {
+      const one = fake({ workers: 1, plan: [] });
+      yield* runRepoCheck(4).pipe(Effect.provide(one.layer));
+      const none = fake({ workers: 0, plan: [] });
+      const error = yield* Effect.flip(runRepoCheck(4).pipe(Effect.provide(none.layer)));
+      expect(error).toMatchObject({ _tag: "NotRun", message: "the fleet gave no worker of the 4 asked" });
+      expect(none.calls).toEqual(["create acme/app 4", "end c"]);
+    }),
+  );
+
+  it.effect("says it was not run, never failed, when a shard's VM died under it (code -1, OUT-45)", () =>
+    Effect.gen(function* () {
+      const { calls, layer } = fake({ workers: 2, plan: PLAN, crash: [1] });
+      const error = yield* Effect.flip(runRepoCheck(2).pipe(Effect.provide(layer)));
+      expect(error).toMatchObject({ _tag: "NotRun" });
+      expect(error.message).toMatch(/^chk-c-1 shard did not finish/);
+      expect(calls.at(-1)).toBe("end c");
+    }),
+  );
+
+  it.live("ends the check, not run, once its shards take the plan's expected time and CHECK_SLACK_MS", () =>
+    Effect.gen(function* () {
+      // Two units of 0.2 s measured: the cap is 0.2 s + CHECK_SLACK_MS after the shards are sent.
+      const units = [
+        { id: "a", ms: 0 },
+        { id: "b", ms: 0 },
+      ];
+      const { calls, layer } = fake({ workers: 2, plan: units, durations: { a: 200, b: 200 }, silent: true });
+      const t0 = Date.now();
+      const error = yield* Effect.flip(runRepoCheck(2, 30_000, { slackMs: 300 }).pipe(Effect.provide(layer)));
+      expect(error).toMatchObject({ _tag: "NotRun", message: "the check took too long (over 0.5 s)" });
+      expect(Date.now() - t0).toBeLessThan(2000);
+      expect(calls.at(-1)).toBe("end c");
     }),
   );
 });

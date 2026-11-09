@@ -9,8 +9,11 @@
 // the declaration's `run`, the verdicts fanned back in.
 //
 // Exit 0: every unit passed. 1: one failed (its log printed). 3: the fleet did not run it
-// (unreachable, no warm checkout yet, no VM free, a worker lost): the caller decides what to do;
-// this command never falls back to a local run on its own.
+// (unreachable, no warm checkout yet, no VM free, a worker lost, a step its VM could not finish, or
+// the check past its time): the caller decides what to do; this command never falls back to a local
+// run on its own. Its time (since 1.7.0): the plan's expected time (the slowest shard's, from the
+// units' last runs) and CHECK_SLACK_MS once the shards are sent, READY_MS before; a check waiting
+// longer is ended and not run, so a presubmit never waits on the fleet past what it would take.
 // Needs OUTRUN_API_TOKEN, an installation's API token (`ort_…`), and its installation id
 // (OUTRUN_INSTALLATION or --installation); OUTRUN_API, the control plane (https://api.outrun.sh). OUTRUN_GITHUB_TOKEN, a GitHub token that may read the
 // repository, is sent with the check (header X-GitHub-Token) so the Minis fetch their mirror of a
@@ -29,8 +32,14 @@ import { expectedDurations, shard } from "./balance.ts";
 // The check protocol this client speaks (the control plane refuses another): 2, the units of the
 // repository's own declaration.
 const CHECK_PROTOCOL = 2;
-// How long one check may take, end to end.
+// How long one check may take, end to end, at most.
 const CHECK_MS = 10 * 60_000;
+// Until every worker is up and patched and the plan is made: the agent's own deadline for an apply
+// with its plan and install (mac/agent/checks.ts APPLY_MS) and a worker's restore.
+const READY_MS = 150_000;
+// Over the plan's expected time, what a check's shards may take before it is ended, not run (OUT-45,
+// 2026-11-09: checks waited 3 to 10 min on a worker that had died).
+const CHECK_SLACK_MS = 30_000;
 
 /** The fleet did not run the check (exit 3): why. */
 export class NotRun extends Schema.TaggedError<NotRun>()("NotRun", { message: Schema.String }) {}
@@ -142,17 +151,22 @@ export const splitUnits = (units: readonly Unit[], n: number): string[][] => {
 };
 
 // The events until `done` says the check has what it waits for; a worker lost ends it.
-const waitFor = (id: string, from: number, done: (events: readonly CheckEvent[]) => boolean, deadline: number) =>
+const waitFor = (id: string, from: number, done: (events: readonly CheckEvent[]) => boolean, deadline: number, since: number) =>
   Effect.gen(function* () {
     const api = yield* CheckApi;
     const seen: CheckEvent[] = [];
     let after = from;
     while (!done(seen)) {
-      if (Date.now() > deadline) return yield* new NotRun({ message: "the check took too long" });
-      const more = yield* api.events(id, after);
-      for (const event of more) {
+      if (Date.now() >= deadline) return yield* new NotRun({ message: `the check took too long (over ${s(deadline - since)})` });
+      // Never waits past the deadline for an answer (a poll waits up to 20 s for an event).
+      const answer = yield* api.events(id, after).pipe(Effect.timeoutOption(Math.max(0, deadline - Date.now())));
+      if (answer._tag === "None") continue;
+      for (const event of answer.value) {
         after = Math.max(after, event.seq);
         if (event.step === "lost") return yield* new NotRun({ message: `worker ${event.worker} was lost: ${event.log}` });
+        // A step its Mini could not finish (its VM died, its guest stopped answering): says nothing of
+        // the change (a control plane before OUT-45's sent it as is, read as a failure by 1.6.0).
+        if (event.code < 0) return yield* new NotRun({ message: `${event.worker} ${event.step} did not finish: ${event.log.slice(-500)}` });
         seen.push(event);
       }
     }
@@ -173,23 +187,28 @@ export const overTarget = (units: readonly Unit[], targetMs: number) => {
 
 // One check, end to end; the report on stdout. `targetMs`: the time the check aims at, a unit
 // alone over it is reported.
-export const runRepoCheck = (workers: number, targetMs = 30_000) =>
+// `slackMs`: CHECK_SLACK_MS (shorter only in tests).
+export const runRepoCheck = (workers: number, targetMs = 30_000, { slackMs = CHECK_SLACK_MS } = {}) =>
   Effect.gen(function* () {
     const api = yield* CheckApi;
     const repo = yield* Repo;
     const t0 = Date.now();
-    const deadline = t0 + CHECK_MS;
+    const cap = t0 + CHECK_MS;
     const name = yield* repo.name;
     const check = yield* api.create(name, workers);
     return yield* Effect.gen(function* () {
       const n = check.workers.length;
+      // Fewer workers than asked: said at once, the check slower than its split for `workers`; none
+      // is not run (a control plane answers `full` itself; this one never waits on no worker).
+      if (n === 0) return yield* new NotRun({ message: `the fleet gave no worker of the ${workers} asked` });
+      if (n < workers) yield* Console.error(`outrun check: ${n} worker(s) of the ${workers} asked (the fleet has no more free now)`);
       if (new Set(check.workers.map((w) => w.sha ?? check.sha)).size > 1)
         yield* Console.error(`outrun check: the workers start from ${new Set(check.workers.map((w) => w.sha ?? check.sha)).size} warm commits`);
       const patches: Record<string, string> = {};
       for (const sha of new Set([check.sha, ...check.workers.map((w) => w.sha ?? check.sha)])) patches[sha] = yield* repo.patchFrom(sha);
       yield* api.patch(check.id, check.sha, patches, yield* repo.messageFrom(check.sha));
       // Every worker up and patched; the first's apply carries the plan.
-      const ready = yield* waitFor(check.id, 0, (events) => events.filter((e) => e.step === "apply").length === n, deadline);
+      const ready = yield* waitFor(check.id, 0, (events) => events.filter((e) => e.step === "apply").length === n, Math.min(cap, t0 + READY_MS), t0);
       const failed = ready.events.find((e) => e.code !== 0);
       if (failed) return yield* new NotRun({ message: `${failed.worker} ${failed.step}: exit ${failed.code}: ${failed.log.slice(-500)}` });
       const readyAt = Date.now();
@@ -202,7 +221,7 @@ export const runRepoCheck = (workers: number, targetMs = 30_000) =>
       const tasks = timeUnits(planOf(first), learned);
       const ups = ready.events.filter((e) => e.step === "up");
       const lines = [
-        `outrun check: ${n} worker(s) on ${[...new Set(check.workers.map((w) => w.mini))].join(", ")}, main at ${check.sha.slice(0, 8)}`,
+        `outrun check: ${n} of ${workers} worker(s) on ${[...new Set(check.workers.map((w) => w.mini))].join(", ")}, main at ${check.sha.slice(0, 8)}`,
         `  up ${s(Math.max(...ups.map((e) => e.ms)))} · apply ${s(Number(first.json.apply ?? 0))} · plan ${s(Number(first.json.plan ?? 0))} · ready after ${s(readyAt - t0)}`,
       ];
       if (tasks.length === 0) {
@@ -217,7 +236,14 @@ export const runRepoCheck = (workers: number, targetMs = 30_000) =>
       lines.push(`  times: ${seen} of ${tasks.length} unit(s) from their last run, the rest estimated`);
       if (over.length > 0) lines.push(`  over the ${s(targetMs)} target alone (split them): ${over.map(([id, ms]) => `${id} ${s(ms)}`).join(", ")}`);
       yield* api.shards(check.id, shards);
-      const ran = yield* waitFor(check.id, ready.after, (events) => events.filter((e) => e.step === "shard").length === shards.length, deadline);
+      const sentAt = Date.now();
+      const ran = yield* waitFor(
+        check.id,
+        ready.after,
+        (events) => events.filter((e) => e.step === "shard").length === shards.length,
+        Math.min(cap, sentAt + expectedMs + slackMs),
+        sentAt,
+      );
       const results = ran.events.filter((e) => e.step === "shard");
       const all = results.flatMap(shardTasks);
       const red = all.filter((t) => t.exit !== 0 && t.exit !== null);
