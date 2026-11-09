@@ -333,13 +333,15 @@ const junitMergeCommand = Command.make(
 
 const e2eEnvCommand = Command.make("e2e-env", {}, () =>
   Effect.gen(function* () {
-    const lines = e2eEnvLines(env.VARIABLES ?? "", env.NAMES ?? "", env.SECRETS ?? "", `OUTRUN_EOF_${crypto.randomUUID()}`);
-    if (typeof lines !== "string") return yield* lines;
-    if (lines) yield* Console.log(lines.replace(/\n$/, ""));
+    const result = e2eEnvLines(env.VARIABLES ?? "", env.NAMES ?? "", env.SECRETS ?? "", `OUTRUN_EOF_${crypto.randomUUID()}`);
+    if (result instanceof UsageInvalid) return yield* result;
+    // Masked before anything else runs: the runner reads workflow commands on stderr too, and stdout is $GITHUB_ENV.
+    for (const value of result.masks) yield* Console.error(`::add-mask::${value}`);
+    if (result.lines) yield* Console.log(result.lines.replace(/\n$/, ""));
   }),
 ).pipe(
   Command.withDescription(
-    "$GITHUB_ENV's lines for the e2e workflow: VARIABLES (NAME=value per line) and the secrets NAMES lists, read from SECRETS (the secrets context as JSON)",
+    "$GITHUB_ENV's lines for the e2e workflow: VARIABLES (NAME=value per line), the secrets NAMES lists and the NAME=value lines of the `env` secret, read from SECRETS (the secrets context as JSON); each secret value is masked on stderr first",
   ),
 );
 

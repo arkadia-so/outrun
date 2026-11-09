@@ -223,6 +223,16 @@ jobs:
     secrets: inherit
 ```
 
+`secrets: inherit` reaches the workflow only from a repository of the same organization (GitHub's
+rule). From another organization, write the variables in the `env` secret instead, NAME=value per
+line; each value is masked in the logs:
+
+```yaml
+    secrets:
+      env: |
+        ACME_MODEL_TOKEN=${{ secrets.ACME_MODEL_TOKEN }}
+```
+
 `environment` puts the plan job (which builds the app) and the shards in that GitHub environment:
 its secrets reach `secrets: inherit`, and their OIDC tokens carry its subject
 (`repo:<owner>/<repo>:environment:<name>`), so a cloud trust that accepts only that environment
