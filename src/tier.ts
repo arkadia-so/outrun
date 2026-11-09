@@ -5,7 +5,7 @@
 // (`$OUTRUN_CACHE/.outrun-used/<entry>`, kept from pruning); saving writes the job's folder through a
 // temporary name starting with `.`, renamed into place, so nothing is promoted half-written. A runner
 // with no tier (a Linux runner, GitHub's) restores nothing and saves nothing: slower, never wrong.
-// The e2e workflow's app, build cache and XCTest runner all go through here (DESIGN.md §13.7).
+// The e2e workflow's app, build cache and XCTest runner all go through here (README.md "End-to-end tests").
 import { existsSync } from "node:fs";
 import { copyFile, mkdir, rename, writeFile } from "node:fs/promises";
 import { Effect } from "effect";

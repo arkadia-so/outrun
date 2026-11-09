@@ -1,6 +1,6 @@
 // `outrun check`: the repository's fast CI on the tree of HEAD, run on outrun's Linux VMs instead of
-// this machine (DESIGN.md §12), as the repository declares it in its `.outrun/check.json` (README.md,
-// "outrun check"; DESIGN.md §12.7).
+// this machine, as the repository declares it in its `.outrun/check.json` (README.md "outrun
+// check: the fast CI on outrun's VMs").
 // One check: its workers placed at the priority tier on VMs restored from a warm checkout (a commit
 // of main), HEAD's tree sent as a patch on that commit, the first worker's plan (the units to run,
 // each with its expected time) split over the workers by longest processing time first (outrun's
@@ -72,8 +72,9 @@ export class CheckApi extends Context.Service<
   {
     readonly create: (repo: string, workers: number) => Effect.Effect<Created, NotRun>;
     // `patches`: HEAD's tree as a patch on each warm commit the workers start from (by sha);
-    // `message`: the commit messages of the change (Repo `messageFrom`), the VM's commit's.
-    readonly patch: (id: string, sha: string, patches: Readonly<Record<string, string>>, message: string) => Effect.Effect<void, NotRun>;
+    // `message`: the commit messages of the change (Repo `messageFrom`), the VM's commit's;
+    // `change`: the push's base to HEAD (Repo `base`), absent when the clone has no remote main.
+    readonly patch: (id: string, sha: string, patches: Readonly<Record<string, string>>, message: string, change?: string) => Effect.Effect<void, NotRun>;
     readonly shards: (id: string, shards: readonly { worker: number; tasks: readonly string[] }[]) => Effect.Effect<void, NotRun>;
     readonly events: (id: string, after: number) => Effect.Effect<readonly CheckEvent[], NotRun>;
     readonly end: (id: string) => Effect.Effect<void>;
@@ -89,6 +90,9 @@ export class Repo extends Context.Service<
     // The messages of the commits HEAD has and `sha` lacks, newest first: what the checks see as the
     // change's commits (a trailer such as `No-Changelog:`), as a local run reads them with git log.
     readonly messageFrom: (sha: string) => Effect.Effect<string, NotRun>;
+    // The push's base: where HEAD leaves the remote's main (merge-base with origin/HEAD, else
+    // origin/main or origin/master), and HEAD's tree as a patch on it; none without such a ref.
+    readonly base: Effect.Effect<{ readonly sha: string; readonly change: string } | undefined, NotRun>;
   }
 >()("outrun/cli/Repo") {}
 
@@ -206,7 +210,10 @@ export const runRepoCheck = (workers: number, targetMs = 30_000, { slackMs = CHE
         yield* Console.error(`outrun check: the workers start from ${new Set(check.workers.map((w) => w.sha ?? check.sha)).size} warm commits`);
       const patches: Record<string, string> = {};
       for (const sha of new Set([check.sha, ...check.workers.map((w) => w.sha ?? check.sha)])) patches[sha] = yield* repo.patchFrom(sha);
-      yield* api.patch(check.id, check.sha, patches, yield* repo.messageFrom(check.sha));
+      // The plan against the push's base, not the warm's commit: a warm behind main otherwise counts
+      // every commit landed since as the push's (outrun 1.8). The VM commits the base, then the change.
+      const base = yield* repo.base;
+      yield* api.patch(check.id, check.sha, patches, yield* repo.messageFrom(base?.sha ?? check.sha), base?.change);
       // Every worker up and patched; the first's apply carries the plan.
       const ready = yield* waitFor(check.id, 0, (events) => events.filter((e) => e.step === "apply").length === n, Math.min(cap, t0 + READY_MS), t0);
       const failed = ready.events.find((e) => e.code !== 0);
@@ -221,7 +228,7 @@ export const runRepoCheck = (workers: number, targetMs = 30_000, { slackMs = CHE
       const tasks = timeUnits(planOf(first), learned);
       const ups = ready.events.filter((e) => e.step === "up");
       const lines = [
-        `outrun check: ${n} of ${workers} worker(s) on ${[...new Set(check.workers.map((w) => w.mini))].join(", ")}, main at ${check.sha.slice(0, 8)}`,
+        `outrun check: ${n} of ${workers} worker(s) on ${[...new Set(check.workers.map((w) => w.mini))].join(", ")}, main at ${check.sha.slice(0, 8)}${base ? `, the push on ${base.sha.slice(0, 8)}` : ""}`,
         `  up ${s(Math.max(...ups.map((e) => e.ms)))} · apply ${s(Number(first.json.apply ?? 0))} · plan ${s(Number(first.json.plan ?? 0))} · ready after ${s(readyAt - t0)}`,
       ];
       if (tasks.length === 0) {
@@ -295,6 +302,13 @@ const RepoLive = Layer.succeed(Repo, {
       exec("git", ["log", "--no-merges", "--format=%B", `${sha}..HEAD`]),
       exec("git", ["log", "--no-merges", "--format=%(trailers:only,unfold)", `${sha}..HEAD`]),
     ]).pipe(Effect.map(([bodies, trailers]) => changeMessage(bodies, trailers))),
+  base: Effect.gen(function* () {
+    for (const ref of ["origin/HEAD", "origin/main", "origin/master"]) {
+      const sha = yield* exec("git", ["merge-base", "HEAD", ref]).pipe(Effect.catchTag("NotRun", () => Effect.succeed("")));
+      if (sha.trim()) return { sha: sha.trim(), change: yield* exec("git", ["diff", "--binary", "--no-color", "--no-ext-diff", sha.trim(), "HEAD"]) };
+    }
+    return undefined;
+  }),
 });
 
 // The control plane's bound on a check's message (control-plane checks.ts MESSAGE_MAX_CHARS).
@@ -353,10 +367,12 @@ const checkApiLive = (api: string, installation: string, token: string, githubTo
       }).pipe(Effect.map((body) => body as unknown as Created)),
     // `patch`, the check's own base's, for a control plane before 1.6, which reads no `patches`.
     // `patches` only when the workers start from several commits.
-    patch: (id, sha, patches, message) =>
-      request(`/${id}/patch`, { method: "POST", body: { patch: patches[sha] ?? "", ...(Object.keys(patches).length > 1 ? { patches } : {}), message } }).pipe(
-        Effect.asVoid,
-      ),
+    // `change`: ignored by a control plane before 1.8, whose VMs plan against the warm's commit.
+    patch: (id, sha, patches, message, change) =>
+      request(`/${id}/patch`, {
+        method: "POST",
+        body: { patch: patches[sha] ?? "", ...(Object.keys(patches).length > 1 ? { patches } : {}), message, ...(change === undefined ? {} : { change }) },
+      }).pipe(Effect.asVoid),
     shards: (id, shards) => request(`/${id}/shards`, { method: "POST", body: { shards } }).pipe(Effect.asVoid),
     events: (id, after) =>
       request(`/${id}/events?after=${after}`, { method: "GET" }, 40_000).pipe(Effect.map((body) => (body.events ?? []) as readonly CheckEvent[])),

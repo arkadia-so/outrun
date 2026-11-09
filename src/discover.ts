@@ -1,11 +1,11 @@
 // `--e2e`: the configuration outrun builds itself from a repository's TesterArmy e2e configs, with no
-// outrun.json (DESIGN.md §13). Every `e2e.config.{ts,mts,js,mjs}` git knows is a suite: its folder is
+// outrun.json (README.md "End-to-end tests"). Every `e2e.config.{ts,mts,js,mjs}` git knows is a suite: its folder is
 // the suite's, its tests are the ones TesterArmy's own CLI lists for it (`e2e list --reporter json`,
 // so a config's `tests` glob and filters mean what they mean to `e2e run`), and a batch is `e2e run`
 // on the nearest installed CLI, under Node (found at the batch: adapters/e2e.ts).
 //
 // A unit is one test, named `file:line` by the line e2e's listing declares it at, which `e2e run`
-// selects as a positional (DESIGN.md §13.7): a file of long tests spreads over several runners. A
+// selects as a positional (README.md "End-to-end tests"): a file of long tests spreads over several runners. A
 // serial group (`describe(..., { serial: true })`) runs in order on one worker and retries as a whole,
 // so it stays one unit, at its first member's line (which selects the whole group). Tests declared on
 // one line (a loop) are one unit. OUTRUN_E2E_FILTER holds e2e's own selection flags (`--tag`,
@@ -26,9 +26,9 @@
 // under an `e2e/` or `test(s)/` folder; a file with no test is not listed), the config's import
 // closure, the lockfiles (the CLI's version) and the variables the folder reads. A file named like no
 // test whose tests go from none to some keeps a stale listing until another input changes: the one
-// approximation, taken so an edit of the app keeps the listing (DESIGN.md §13.6). A plan whose listings are
+// approximation, taken so an edit of the app keeps the listing (README.md "End-to-end tests"). A plan whose listings are
 // all kept needs neither the CLI nor the repository's dependencies (`cachedOnly`), so the plan job
-// skips the install (DESIGN.md §13.6).
+// skips the install (README.md "End-to-end tests").
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, rename } from "node:fs/promises";
 import { posix } from "node:path";
@@ -290,7 +290,7 @@ const keep = (listings: Listings, key: string, tests: readonly ListedTest[], fro
   }).pipe(Effect.catchTag("ConfigInvalid", (e) => Console.error(`outrun: ${e.message}`)));
 
 /**
- * The configuration of every e2e config of the checkout (DESIGN.md §13); with `cachedOnly`, the
+ * The configuration of every e2e config of the checkout (README.md "End-to-end tests"); with `cachedOnly`, the
  * configs whose listing is not kept are `missing` and no suite is made.
  */
 export const discoverE2e = (repo: string, blobs: Blobs, env: Env, listings: Listings, only?: readonly string[]) =>

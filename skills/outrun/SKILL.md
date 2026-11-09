@@ -29,6 +29,38 @@ Three rules hold throughout:
   after figure is a guess.
 - **One change, one commit, one rollback.** Write each change's rollback in its commit message.
 
+## What is automatic, what you configure today
+
+The goal is that changing `runs-on` and adding `uses: arkadia-so/outrun@v1` is all a repository
+does. It is not there yet.
+
+**Automatic** once a job runs on an outrun label:
+
+- On Linux runners, `actions/cache` (and every `setup-*` cache built on it) is served by outrun's
+  cache, close to the machines, scoped by repository and branch as on GitHub. On macOS runners too,
+  with GitHub's cache behind it: an entry outrun's cache does not have is looked up there, and a
+  save outrun's cache cannot take goes there.
+- On Linux runners, the toolchains jobs install in the tool cache and the usual dependency caches
+  of the home (npm, pnpm, pub, cargo, rustup, uv, Gradle...) come back warm for the repository's
+  next jobs.
+- A job takes a runner already waiting whenever one is free.
+
+**What you configure today:**
+
+1. **The verdict cache** (`outrun lookup`, `record`, `plan`, `test`): `uses: arkadia-so/outrun@v1`,
+   `permissions: id-token: write` and `OUTRUN_CACHE_URL: https://cache.outrun.sh`. Without the URL,
+   verdicts stay on one machine. The e2e reusable workflow sets the URL itself, but still needs
+   `id-token: write`.
+2. **Units**: `outrun.json` (suites, commands) and `.outrun/check.json` for `outrun check`. Only
+   TesterArmy e2e suites are found with no file (`--e2e`). Nx and Bazel keep their own task graph,
+   and you start `outrun nx-cache` or `outrun bazel-cache` and point the tool at it.
+3. **Large caches on macOS runners**: `actions/cache` there is outrun's cache, but a folder
+   stays on the machines only when the workflow restores and saves it (`$OUTRUN_CACHE`,
+   `$OUTRUN_CACHE_PROTECTED`, `outrun tier restore|save`, or the e2e workflow's `build-cache`).
+4. **Cache saves**: outrun does not trim them. Restricting your own saves is lever 1 below.
+5. **Warm runners**: outrun sets them on request (repository, label, count, simulator). They do
+   not follow demand yet.
+
 ## 1. Move
 
 1. Install outrun's GitHub App on the organisation ([outrun.sh](https://outrun.sh)).
@@ -166,6 +198,7 @@ monorepo unless stated otherwise.
 | -- | -- | -- | -- |
 | Cache per machine | Every run that lands on another machine is cold. The same job takes 505 s, then 1670 s, then 613 s. | The cache lived on one machine, and the next job landed elsewhere. | Use the shared tiers, written by the default branch. Never judge a cache on one run: take three, on different machines. |
 | Cache save dominating | The post step takes longer than the work (248 s of 324). | The Actions cache saved a large folder on every run. | Save only on the default branch when the key changed, or keep the cache on the machine (lever 6). |
+| A cache moved to a new store, writers first | A job misses, or fails on a missing file, restoring what an earlier job just saved, on some runners only. A job that untars a build without checking the restore hit fails further on. | The new store (a new key, path, tier or cache service) reached the writers before every reader: a save to the new store is invisible to a job still reading the old one, and runners or branches move one by one. | Readers first: every reader looks in the new store and falls back to the old one. Turn writes to the new store on only once every reader reads it. Check that a restore hit before using what it restores. |
 | Jobs lost to the infrastructure | Shards get a runner, run no step and fail at the job's timeout. Rerunning one shard then makes GitHub refuse the others (403). | The runners were restarted under running jobs. | Rerun all failed jobs together (`gh run rerun $RUN --failed`), never one by one. Report the run id to outrun. |
 | Network errors in a burst | ENOTFOUND, ECONNRESET, a TLS handshake taking seconds, 504s downloading a tool from GitHub. | Many new connections at once, or the upstream server failing. | Retry every download with backoff (3 tries). Prefer the image's tools. Pin tools by version and checksum. |
 | arm64 gaps | `flutter` has no Linux arm64 archive. Android's build tools fail on arm64. `gh`, `zip`, `sqlite3`, `pip` or `aws` are missing. | Upstream ships x64 only, or the image lacks the tool. | Install Flutter from its git tag and run `precache`. Keep Android jobs on an x64 label. Install a missing tool only when `command -v` fails. |

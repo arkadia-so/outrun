@@ -324,9 +324,14 @@ the time of the longest share. The repository declares its check in `.outrun/che
   fatal), `install` (after the patch, only when a file matching `when` changed).
 - `plan` prints a JSON array of units, each an id or `{"id", "ms", "group"}`: `ms` its expected
   time, used only until the unit has run once (since 1.6), units of one `group` kept on one VM.
-  `OUTRUN_CHECK_BASE` is the warm commit; HEAD is one commit on it holding the change, whose message is the change's commit messages, newest first,
-  with all their trailers last, so `git log "$OUTRUN_CHECK_BASE..HEAD"` reads them as locally
-  (since 1.5.3).
+  `OUTRUN_CHECK_BASE` is the push's base, where HEAD leaves the remote's main (`git merge-base
+  HEAD origin/HEAD`, else `origin/main` or `origin/master`), however far the warm commit is behind
+  it (since 1.8; before, the warm commit, so what landed on main since the warm counted as the
+  push's); HEAD is one commit on it holding the change, whose message is the change's commit
+  messages, newest first, with all their trailers last, so `git log "$OUTRUN_CHECK_BASE..HEAD"`
+  reads them as locally (since 1.5.3). Planning against it, a one-file push plans that file's
+  checks only. A clone with none of these refs plans against the warm commit. `install` runs
+  when its files differ between the warm commit and HEAD.
 - `run` runs the units in `OUTRUN_CHECK_UNITS` (one per line) and exits 0 when they pass. It may
   write `[{"id", "ms", "exit", "cache"}]` to `OUTRUN_CHECK_REPORT`: each unit's `ms` is kept per
   repository, and the next check splits on these measured times (the same estimator as `outrun

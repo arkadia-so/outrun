@@ -28,6 +28,8 @@ const fake = (opts: {
   refuse?: string;
   lose?: boolean;
   message?: string;
+  // The push's base (Repo `base`), absent: a clone with no remote main.
+  base?: string;
   durations?: Record<string, number>;
   shas?: string[];
   // The shards a dead VM leaves unfinished (code -1), and whether the shards never answer.
@@ -52,11 +54,12 @@ const fake = (opts: {
           ...(opts.durations ? { durations: opts.durations } : {}),
         });
       }),
-    patch: (_id, sha, patches, message) =>
+    patch: (_id, sha, patches, message, change) =>
       Effect.sync(() => {
         calls.push(`patch ${patches[sha]}`);
         if (Object.keys(patches).length > 1) calls.push(`patches ${Object.values(patches).join(", ")}`);
         if (message) calls.push(`message ${message}`);
+        if (change !== undefined) calls.push(`change ${change}`);
         if (opts.lose) return void push({ worker: names[1]!, step: "lost", code: -1, json: {}, log: "mm2 left the fleet" });
         names.forEach((worker, i) =>
           push({ worker, step: "apply", code: 0, json: i === 0 ? { apply: 300, plan: 4000, ...(opts.plan ? { units: opts.plan } : {}) } : { apply: 300 } }),
@@ -89,7 +92,8 @@ const fake = (opts: {
   const repo = Layer.succeed(Repo, {
     name: Effect.succeed("acme/app"),
     patchFrom: (sha) => Effect.succeed(`diff from ${sha.slice(0, 4)}`),
-    messageFrom: () => Effect.succeed(opts.message ?? ""),
+    messageFrom: (sha) => Effect.succeed(opts.message === undefined ? "" : `${opts.message} (since ${sha.slice(0, 4)})`),
+    base: Effect.succeed(opts.base ? { sha: opts.base, change: `diff from ${opts.base.slice(0, 4)}` } : undefined),
   });
   return { calls, layer: Layer.merge(api, repo) };
 };
@@ -194,7 +198,15 @@ describe("outrun check", () => {
     Effect.gen(function* () {
       const { calls, layer } = fake({ workers: 1, plan: [], message: "Fix the thing\n\nNo-Changelog: internal" });
       yield* runRepoCheck(1).pipe(Effect.provide(layer));
-      expect(calls.slice(1, 3)).toEqual(["patch diff from aaaa", "message Fix the thing\n\nNo-Changelog: internal"]);
+      expect(calls.slice(1, 3)).toEqual(["patch diff from aaaa", "message Fix the thing\n\nNo-Changelog: internal (since aaaa)"]);
+    }),
+  );
+
+  it.effect("sends the push's change from its base, and the messages since that base, so a warm behind main plans only the push", () =>
+    Effect.gen(function* () {
+      const { calls, layer } = fake({ workers: 1, plan: [], message: "Fix", base: "c".repeat(40) });
+      yield* runRepoCheck(1).pipe(Effect.provide(layer));
+      expect(calls.slice(1, 4)).toEqual(["patch diff from aaaa", "message Fix (since cccc)", "change diff from cccc"]);
     }),
   );
 

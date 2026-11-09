@@ -162,7 +162,7 @@ const planCommand = Command.make(
         out: flags.out,
         e2e: flags.e2e,
         // An e2e runner costs its pickup and setup (browsers, a simulator) and runs one CLI at a time;
-        // 16 is the most macOS VMs one run takes of the fleet (DESIGN.md §13.3).
+        // 16 is the most macOS VMs one run takes of the fleet (README.md "End-to-end tests").
         runners: {
           max: Option.getOrElse(flags.maxRunners, () => (flags.e2e ? 16 : 8)),
           targetMs: Option.getOrElse(flags.target, () => (flags.e2e ? 300 : 120)) * 1000,
