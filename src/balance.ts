@@ -9,6 +9,41 @@ export interface Timed {
   readonly durationMs: number;
 }
 
+/** A unit to time: its id, its suite, and the guesses for it when it was never measured. */
+export interface ToTime {
+  readonly id: string;
+  readonly suite: string;
+  /** The unit's own guess (a plan's `ms`), before any measured duration of its suite. */
+  readonly guessMs?: number;
+  /** Its suite's default, when no unit of the suite was measured either. */
+  readonly defaultMs?: number;
+}
+
+/** What a unit counts for when nothing at all is known of it or its suite. */
+export const UNKNOWN_MS = 1000;
+
+const median = (values: readonly number[]) => {
+  if (values.length === 0) return undefined;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+};
+
+/**
+ * Each unit's expected duration, from the durations earlier runs measured (`measured`, by id): its
+ * own when it was timed; else its own guess; else the median of its suite's timed units; else its
+ * suite's default; else UNKNOWN_MS. The one estimator of outrun's split (the engine's runners and
+ * batches, `outrun check`'s workers): a guess stands only for a unit never measured.
+ */
+export const expectedDurations = (units: readonly ToTime[], measured: ReadonlyMap<string, number | undefined>): Map<string, number> => {
+  const known = new Map<string, number[]>();
+  for (const u of units) {
+    const ms = measured.get(u.id);
+    if (ms !== undefined) known.set(u.suite, [...(known.get(u.suite) ?? []), ms]);
+  }
+  const medians = new Map([...known].map(([suite, values]) => [suite, median(values)]));
+  return new Map(units.map((u) => [u.id, measured.get(u.id) ?? u.guessMs ?? medians.get(u.suite) ?? u.defaultMs ?? UNKNOWN_MS]));
+};
+
 /** Longest first, then by id: a total order, so the plan is the same on every runner. */
 const byDuration = <T extends Timed>(a: T, b: T) => b.durationMs - a.durationMs || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 

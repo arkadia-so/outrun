@@ -3,12 +3,34 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
-import { changeMessage, CheckApi, type CheckEvent, MESSAGE_MAX_CHARS, NotRun, Repo, runRepoCheck, splitUnits, type Unit } from "./check.ts";
+import {
+  changeMessage,
+  CheckApi,
+  type CheckEvent,
+  MESSAGE_MAX_CHARS,
+  NotRun,
+  overTarget,
+  Repo,
+  runRepoCheck,
+  splitUnits,
+  timeUnits,
+  type Unit,
+} from "./check.ts";
 
 const SHA = "a".repeat(40);
 
 // A control plane whose workers answer at once: `plan` is worker 0's plan, `fail` the shards that fail.
-const fake = (opts: { workers: number; plan: Unit[] | undefined; fail?: number[]; refuse?: string; lose?: boolean; message?: string }) => {
+// `durations`: what the control plane learned of the units; `shas`: each worker's warm commit.
+const fake = (opts: {
+  workers: number;
+  plan: Unit[] | undefined;
+  fail?: number[];
+  refuse?: string;
+  lose?: boolean;
+  message?: string;
+  durations?: Record<string, number>;
+  shas?: string[];
+}) => {
   const calls: string[] = [];
   const events: CheckEvent[] = [];
   const names = Array.from({ length: opts.workers }, (_, i) => `chk-c-${i}`);
@@ -20,11 +42,17 @@ const fake = (opts: { workers: number; plan: Unit[] | undefined; fail?: number[]
         calls.push(`create ${repo} ${workers}`);
         if (opts.refuse) return Effect.fail(new NotRun({ message: opts.refuse }));
         for (const worker of names) push({ worker, step: "up", code: 0, json: {} });
-        return Effect.succeed({ id: "c", sha: SHA, workers: names.map((name, i) => ({ name, mini: `mm${i + 1}` })) });
+        return Effect.succeed({
+          id: "c",
+          sha: SHA,
+          workers: names.map((name, i) => ({ name, mini: `mm${i + 1}`, ...(opts.shas?.[i] ? { sha: opts.shas[i] } : {}) })),
+          ...(opts.durations ? { durations: opts.durations } : {}),
+        });
       }),
-    patch: (_id, patch, message) =>
+    patch: (_id, sha, patches, message) =>
       Effect.sync(() => {
-        calls.push(`patch ${patch}`);
+        calls.push(`patch ${patches[sha]}`);
+        if (Object.keys(patches).length > 1) calls.push(`patches ${Object.values(patches).join(", ")}`);
         if (message) calls.push(`message ${message}`);
         if (opts.lose) return void push({ worker: names[1]!, step: "lost", code: -1, json: {}, log: "mm2 left the fleet" });
         names.forEach((worker, i) =>
@@ -74,6 +102,31 @@ describe("splitUnits", () => {
   });
 });
 
+describe("timeUnits", () => {
+  it("times each unit by its last run, takes the plan's guess only for a unit never measured, else the measured units' median", () => {
+    const timed = timeUnits(PLAN, { "test/a_test.dart": 2000, lint: 6000, fmt: 1000 });
+    expect(timed.map((u) => [u.id, u.ms])).toEqual([
+      ["test/a_test.dart", 2000],
+      ["test/b_test.dart", 4000],
+      ["lint", 6000],
+      ["fmt", 1000],
+      ["test/c_test.dart", 2000],
+    ]);
+  });
+  it("falls back to the plan's guesses, and a second for a unit with none, when nothing was measured", () => {
+    expect(timeUnits(PLAN, {}).map((u) => u.ms)).toEqual([9000, 4000, 3000, 2000, 1000]);
+  });
+});
+
+describe("overTarget", () => {
+  it("names the units, and the groups by their total, that alone take longer than the target", () => {
+    expect(overTarget(timeUnits(PLAN, {}), 4500)).toEqual([
+      ["test/a_test.dart", 9000],
+      ["group js", 5000],
+    ]);
+  });
+});
+
 describe("changeMessage", () => {
   it("keeps one commit's message as is, its trailers already last", () => {
     expect(changeMessage("Fix it\n\nNo-Changelog: internal\n\n", "No-Changelog: internal\n\n")).toBe("Fix it\n\nNo-Changelog: internal");
@@ -98,9 +151,32 @@ describe("outrun check", () => {
       yield* runRepoCheck(3).pipe(Effect.provide(layer));
       expect(calls[0]).toBe("create acme/app 3");
       expect(calls[1]).toBe("patch diff from aaaa");
-      const expected = splitUnits(PLAN, 3).map((tasks, worker) => ({ worker, tasks }));
+      const expected = splitUnits(timeUnits(PLAN, {}), 3).map((tasks, worker) => ({ worker, tasks }));
       expect(calls[2]).toBe(`shards ${JSON.stringify(expected)}`);
       expect(calls.at(-1)).toBe("end c");
+    }),
+  );
+
+  it.effect("balances the second run by the first's measured times, not the plan's guesses", () =>
+    Effect.gen(function* () {
+      // The plan guesses a_test is the longest; its last run says lint and fmt (one group) are.
+      const { calls, layer } = fake({ workers: 2, plan: PLAN, durations: { "test/a_test.dart": 1000, "test/b_test.dart": 1000, lint: 8000, fmt: 4000 } });
+      yield* runRepoCheck(2).pipe(Effect.provide(layer));
+      expect(calls[2]).toBe(
+        `shards ${JSON.stringify([
+          { worker: 0, tasks: ["lint", "fmt"] },
+          // c_test, never measured: the measured units' median, 4 s.
+          { worker: 1, tasks: ["test/c_test.dart", "test/a_test.dart", "test/b_test.dart"] },
+        ])}`,
+      );
+    }),
+  );
+
+  it.effect("sends a patch on each warm commit its workers start from", () =>
+    Effect.gen(function* () {
+      const { calls, layer } = fake({ workers: 3, plan: [], shas: [SHA, "b".repeat(40), SHA] });
+      yield* runRepoCheck(3).pipe(Effect.provide(layer));
+      expect(calls.slice(1, 3)).toEqual(["patch diff from aaaa", "patches diff from aaaa, diff from bbbb"]);
     }),
   );
 

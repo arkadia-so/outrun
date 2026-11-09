@@ -1,7 +1,35 @@
 import { describe, expect, it } from "vitest";
-import { batches, fillIdle, runnersFor, shard } from "./balance.ts";
+import { batches, expectedDurations, fillIdle, runnersFor, shard, UNKNOWN_MS } from "./balance.ts";
 
 const unit = (id: string, durationMs: number, suite = "s") => ({ id, suite, durationMs });
+
+describe("expectedDurations", () => {
+  it("takes a unit's measured time, else its own guess, else its suite's median, else the suite's default, else a second", () => {
+    const units = [
+      { id: "a", suite: "x" },
+      { id: "b", suite: "x", guessMs: 500 },
+      { id: "c", suite: "x", guessMs: 700 },
+      { id: "d", suite: "x" },
+      { id: "e", suite: "y", defaultMs: 60_000 },
+      { id: "f", suite: "z" },
+    ];
+    const expected = expectedDurations(
+      units,
+      new Map([
+        ["a", 3000],
+        ["c", 9000],
+      ]),
+    );
+    expect([...expected]).toEqual([
+      ["a", 3000],
+      ["b", 500],
+      ["c", 9000],
+      ["d", 9000],
+      ["e", 60_000],
+      ["f", UNKNOWN_MS],
+    ]);
+  });
+});
 
 describe("shard", () => {
   it("gives every unit to exactly one runner, longest first to the least loaded", () => {

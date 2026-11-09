@@ -13,7 +13,7 @@ import { e2eAdapter } from "./adapters/e2e.ts";
 import { pytestAdapter } from "./adapters/pytest.ts";
 import { vitestAdapter } from "./adapters/vitest.ts";
 import { xcodeAdapter } from "./adapters/xcode.ts";
-import { batches, fillIdle, runnersFor, shard } from "./balance.ts";
+import { batches, expectedDurations, fillIdle, runnersFor, shard, UNKNOWN_MS } from "./balance.ts";
 import { type CacheEntry, divergenceKey, LocalCache, type Put, put, quarantineKey, query, timingKey } from "./cache.ts";
 import { type Config, loadConfig, type Suite } from "./config.ts";
 import { discoverE2e } from "./discover.ts";
@@ -222,12 +222,6 @@ interface Looked {
   readonly commandHits: Set<string>;
 }
 
-const median = (values: readonly number[]) => {
-  if (values.length === 0) return undefined;
-  const sorted = [...values].sort((a, b) => a - b);
-  return sorted[Math.floor(sorted.length / 2)];
-};
-
 const lookup = (
   units: readonly Unit[],
   commands: readonly KeyedCommand[],
@@ -281,13 +275,10 @@ const lookup = (
       previous.set(u.id, ms);
     }
     // A file never timed counts as its suite's median (the suite's default without any).
-    const known = new Map<string, number[]>();
-    for (const u of units) {
-      const ms = previous.get(u.id);
-      if (ms !== undefined) known.set(u.suite.name, [...(known.get(u.suite.name) ?? []), ms]);
-    }
-    const medians = new Map([...known].map(([s, v]) => [s, median(v)]));
-    const durations = new Map(units.map((u) => [u.id, previous.get(u.id) ?? medians.get(u.suite.name) ?? u.suite.defaultMs ?? 1000]));
+    const durations = expectedDurations(
+      units.map((u) => ({ id: u.id, suite: u.suite.name, ...(u.suite.defaultMs === undefined ? {} : { defaultMs: u.suite.defaultMs }) })),
+      previous,
+    );
     // Remember what the remote knew, so the next run here needs no network.
     if (remoteEntries.size > 0) yield* local.set(remoteEntries).pipe(Effect.catchTag("FileFailed", () => Effect.void));
     const commandHits = new Set(commands.map((c) => c.key).filter((k) => valid(k)));
@@ -317,7 +308,7 @@ const prepare = (options: PlanOptions, given?: Keyed) =>
     const looked = yield* lookup(units, keyed.commands, keyed.toolchains, local, options.remote, options.runId, tier);
     const timed = (u: Unit, audit: boolean): TimedUnit => ({
       ...u,
-      durationMs: looked.durations.get(u.id) ?? 1000,
+      durationMs: looked.durations.get(u.id) ?? UNKNOWN_MS,
       measured: looked.previous.get(u.id) !== undefined,
       audit,
     });
@@ -589,7 +580,7 @@ export const test = (options: TestOptions) =>
           continue;
         }
         if (u.key !== p.key) differ.push(u.id);
-        mine.push({ ...u, durationMs: looked.durations.get(u.id) ?? 1000, measured: looked.previous.get(u.id) !== undefined, audit: p.audit });
+        mine.push({ ...u, durationMs: looked.durations.get(u.id) ?? UNKNOWN_MS, measured: looked.previous.get(u.id) !== undefined, audit: p.audit });
       }
       if (differ.length > 0) {
         const why = contextDiff(file.context, planContext(config, keyed.toolchains, options.env));

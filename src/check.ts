@@ -4,7 +4,8 @@
 // One check: its workers placed at the priority tier on VMs restored from a warm checkout (a commit
 // of main), HEAD's tree sent as a patch on that commit, the first worker's plan (the units to run,
 // each with its expected time) split over the workers by longest processing time first (outrun's
-// own `shard`, balance.ts; the units of one group stay on one worker), each shard through
+// own `shard`, balance.ts; the units of one group stay on one worker; each unit's time the one its
+// last run measured, its plan's guess only for a unit never measured), each shard through
 // the declaration's `run`, the verdicts fanned back in.
 //
 // Exit 0: every unit passed. 1: one failed (its log printed). 3: the fleet did not run it
@@ -23,13 +24,11 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import { shard } from "./balance.ts";
+import { expectedDurations, shard } from "./balance.ts";
 
 // The check protocol this client speaks (the control plane refuses another): 2, the units of the
 // repository's own declaration.
 const CHECK_PROTOCOL = 2;
-// A unit the plan gives no time for counts for this much, so unknown units still spread.
-const UNKNOWN_UNIT_MS = 1000;
 // How long one check may take, end to end.
 const CHECK_MS = 10 * 60_000;
 
@@ -50,7 +49,12 @@ export interface CheckEvent {
 export interface Created {
   readonly id: string;
   readonly sha: string;
-  readonly workers: readonly { readonly name: string; readonly mini: string }[];
+  // `sha`: the warm commit this worker starts from, when not the check's (a control plane that takes
+  // one patch per base, `bases`).
+  readonly workers: readonly { readonly name: string; readonly mini: string; readonly sha?: string }[];
+  // What the repository's units took on their last run on the fleet (ms, by unit id): the split's
+  // times (absent from a control plane before 1.6).
+  readonly durations?: Readonly<Record<string, number>>;
 }
 
 // The control plane's check routes (/v1/installations/:id/checks).
@@ -58,8 +62,9 @@ export class CheckApi extends Context.Service<
   CheckApi,
   {
     readonly create: (repo: string, workers: number) => Effect.Effect<Created, NotRun>;
+    // `patches`: HEAD's tree as a patch on each warm commit the workers start from (by sha);
     // `message`: the commit messages of the change (Repo `messageFrom`), the VM's commit's.
-    readonly patch: (id: string, patch: string, message: string) => Effect.Effect<void, NotRun>;
+    readonly patch: (id: string, sha: string, patches: Readonly<Record<string, string>>, message: string) => Effect.Effect<void, NotRun>;
     readonly shards: (id: string, shards: readonly { worker: number; tasks: readonly string[] }[]) => Effect.Effect<void, NotRun>;
     readonly events: (id: string, after: number) => Effect.Effect<readonly CheckEvent[], NotRun>;
     readonly end: (id: string) => Effect.Effect<void>;
@@ -108,14 +113,26 @@ const planOf = (event: CheckEvent): Unit[] => {
     : [];
 };
 
-// The units over at most `n` workers, longest first to the least loaded (balance.ts `shard`), a
-// group as one unit of its total time; workers left without a unit get no shard.
+// Each unit's expected time (balance.ts `expectedDurations`): what its last run on the fleet measured
+// (`learned`); the plan's `ms` only for a unit never measured; then the learned units' median, then
+// UNKNOWN_MS.
+export const timeUnits = (units: readonly Unit[], learned: Readonly<Record<string, number>>): Unit[] => {
+  const measured = new Map(units.flatMap((u): [string, number][] => (typeof learned[u.id] === "number" ? [[u.id, learned[u.id]!]] : [])));
+  const expected = expectedDurations(
+    units.map((u) => ({ id: u.id, suite: "", ...(u.ms > 0 ? { guessMs: u.ms } : {}) })),
+    measured,
+  );
+  return units.map((u) => ({ ...u, ms: expected.get(u.id) ?? u.ms }));
+};
+
+// The units (timed: `timeUnits`) over at most `n` workers, longest first to the least loaded
+// (balance.ts `shard`), a group as one unit of its total time; workers left without a unit get no shard.
 export const splitUnits = (units: readonly Unit[], n: number): string[][] => {
   const parts = new Map<string, { id: string; suite: string; durationMs: number; ids: string[] }>();
   for (const unit of units) {
     const key = unit.group === undefined ? `unit:${unit.id}` : `group:${unit.group}`;
     const part = parts.get(key) ?? { id: key, suite: "", durationMs: 0, ids: [] };
-    part.durationMs += unit.ms > 0 ? unit.ms : UNKNOWN_UNIT_MS;
+    part.durationMs += unit.ms;
     part.ids.push(unit.id);
     parts.set(key, part);
   }
@@ -142,8 +159,21 @@ const waitFor = (id: string, from: number, done: (events: readonly CheckEvent[])
     return { events: seen, after };
   });
 
-// One check, end to end; the report on stdout.
-export const runRepoCheck = (workers: number) =>
+// The units (or groups) whose expected time alone is over `targetMs`: no split makes the check
+// shorter than they are, so they are named for their owner to split.
+export const overTarget = (units: readonly Unit[], targetMs: number) => {
+  const parts = new Map<string, number>();
+  for (const unit of units)
+    parts.set(
+      unit.group === undefined ? unit.id : `group ${unit.group}`,
+      (parts.get(unit.group === undefined ? unit.id : `group ${unit.group}`) ?? 0) + unit.ms,
+    );
+  return [...parts].filter(([, ms]) => ms > targetMs).sort(([, a], [, b]) => b - a);
+};
+
+// One check, end to end; the report on stdout. `targetMs`: the time the check aims at, a unit
+// alone over it is reported.
+export const runRepoCheck = (workers: number, targetMs = 30_000) =>
   Effect.gen(function* () {
     const api = yield* CheckApi;
     const repo = yield* Repo;
@@ -153,8 +183,11 @@ export const runRepoCheck = (workers: number) =>
     const check = yield* api.create(name, workers);
     return yield* Effect.gen(function* () {
       const n = check.workers.length;
-      const patch = yield* repo.patchFrom(check.sha);
-      yield* api.patch(check.id, patch, yield* repo.messageFrom(check.sha));
+      if (new Set(check.workers.map((w) => w.sha ?? check.sha)).size > 1)
+        yield* Console.error(`outrun check: the workers start from ${new Set(check.workers.map((w) => w.sha ?? check.sha)).size} warm commits`);
+      const patches: Record<string, string> = {};
+      for (const sha of new Set([check.sha, ...check.workers.map((w) => w.sha ?? check.sha)])) patches[sha] = yield* repo.patchFrom(sha);
+      yield* api.patch(check.id, check.sha, patches, yield* repo.messageFrom(check.sha));
       // Every worker up and patched; the first's apply carries the plan.
       const ready = yield* waitFor(check.id, 0, (events) => events.filter((e) => e.step === "apply").length === n, deadline);
       const failed = ready.events.find((e) => e.code !== 0);
@@ -165,7 +198,8 @@ export const runRepoCheck = (workers: number) =>
       // never read as nothing to run.
       if (!Array.isArray(first.json.units))
         return yield* new NotRun({ message: `${first.worker}'s plan reported no units: its Mac agent predates the check declaration` });
-      const tasks = planOf(first);
+      const learned = check.durations ?? {};
+      const tasks = timeUnits(planOf(first), learned);
       const ups = ready.events.filter((e) => e.step === "up");
       const lines = [
         `outrun check: ${n} worker(s) on ${[...new Set(check.workers.map((w) => w.mini))].join(", ")}, main at ${check.sha.slice(0, 8)}`,
@@ -176,6 +210,12 @@ export const runRepoCheck = (workers: number) =>
         return;
       }
       const shards = splitUnits(tasks, n).map((ids, worker) => ({ worker, tasks: ids }));
+      const msOf = new Map(tasks.map((t) => [t.id, t.ms]));
+      const expectedMs = Math.max(...shards.map((shard) => shard.tasks.reduce((sum, id) => sum + (msOf.get(id) ?? 0), 0)));
+      const seen = tasks.filter((t) => typeof learned[t.id] === "number").length;
+      const over = overTarget(tasks, targetMs);
+      lines.push(`  times: ${seen} of ${tasks.length} unit(s) from their last run, the rest estimated`);
+      if (over.length > 0) lines.push(`  over the ${s(targetMs)} target alone (split them): ${over.map(([id, ms]) => `${id} ${s(ms)}`).join(", ")}`);
       yield* api.shards(check.id, shards);
       const ran = yield* waitFor(check.id, ready.after, (events) => events.filter((e) => e.step === "shard").length === shards.length, deadline);
       const results = ran.events.filter((e) => e.step === "shard");
@@ -183,7 +223,7 @@ export const runRepoCheck = (workers: number) =>
       const red = all.filter((t) => t.exit !== 0 && t.exit !== null);
       const slowest = [...all].sort((a, b) => b.ms - a.ms).slice(0, 3);
       lines.push(
-        `  ${tasks.length} unit(s) in ${shards.length} shard(s): run ${s(Math.max(...results.map((e) => e.ms)))} (slowest: ${slowest.map((t) => `${t.id} ${s(t.ms)}`).join(", ")})`,
+        `  ${tasks.length} unit(s) in ${shards.length} shard(s): run ${s(Math.max(...results.map((e) => e.ms)))}, expected ${s(expectedMs)} (slowest: ${slowest.map((t) => `${t.id} ${s(t.ms)}`).join(", ")})`,
       );
       const broken = results.filter((e) => e.code !== 0);
       for (const event of broken) lines.push(`--- ${event.worker} ---`, event.log);
@@ -281,10 +321,16 @@ const checkApiLive = (api: string, installation: string, token: string, githubTo
     create: (repo, workers) =>
       request("", {
         method: "POST",
-        body: { protocol: CHECK_PROTOCOL, repo, workers },
+        // `bases`: this CLI sends a patch for each warm commit, so workers may start from several.
+        body: { protocol: CHECK_PROTOCOL, repo, workers, bases: true },
         ...(githubToken ? { headers: { "x-github-token": githubToken } } : {}),
       }).pipe(Effect.map((body) => body as unknown as Created)),
-    patch: (id, patch, message) => request(`/${id}/patch`, { method: "POST", body: { patch, message } }).pipe(Effect.asVoid),
+    // `patch`, the check's own base's, for a control plane before 1.6, which reads no `patches`.
+    // `patches` only when the workers start from several commits.
+    patch: (id, sha, patches, message) =>
+      request(`/${id}/patch`, { method: "POST", body: { patch: patches[sha] ?? "", ...(Object.keys(patches).length > 1 ? { patches } : {}), message } }).pipe(
+        Effect.asVoid,
+      ),
     shards: (id, shards) => request(`/${id}/shards`, { method: "POST", body: { shards } }).pipe(Effect.asVoid),
     events: (id, after) =>
       request(`/${id}/events?after=${after}`, { method: "GET" }, 40_000).pipe(Effect.map((body) => (body.events ?? []) as readonly CheckEvent[])),
@@ -299,12 +345,13 @@ const checkApiLive = (api: string, installation: string, token: string, githubTo
 
 const flags = {
   workers: Flag.Int("workers").pipe(Flag.withDescription("VMs to fan the units over (1 to 8)"), Flag.withDefault(4)),
+  target: Flag.Int("target").pipe(Flag.withDescription("the time the check aims at, in seconds: a unit alone over it is reported"), Flag.withDefault(30)),
   installation: Flag.String("installation").pipe(
     Flag.withDescription("the installation id the token belongs to (default: OUTRUN_INSTALLATION)"),
     Flag.withDefault(""),
   ),
 };
-const handler = ({ workers, installation }: { readonly workers: number; readonly installation: string }) =>
+const handler = ({ workers, target, installation }: { readonly workers: number; readonly target: number; readonly installation: string }) =>
   Effect.gen(function* () {
     const token = process.env.OUTRUN_API_TOKEN;
     if (!token) return yield* new NotRun({ message: "OUTRUN_API_TOKEN is not set (an installation's API token)" });
@@ -315,7 +362,7 @@ const handler = ({ workers, installation }: { readonly workers: number; readonly
     const api = process.env.OUTRUN_API ?? "https://api.outrun.sh";
     const githubToken = process.env.OUTRUN_GITHUB_TOKEN || undefined;
     if (!githubToken) yield* Console.error("outrun check: OUTRUN_GITHUB_TOKEN is not set: the warm checkouts stay at the commit the Minis' mirrors have");
-    return yield* runRepoCheck(workers).pipe(Effect.provide(Layer.merge(checkApiLive(api, id, token, githubToken), RepoLive)));
+    return yield* runRepoCheck(workers, target * 1000).pipe(Effect.provide(Layer.merge(checkApiLive(api, id, token, githubToken), RepoLive)));
   });
 
 export const checkCommand = Command.make("check", flags, handler).pipe(
