@@ -13,7 +13,7 @@
 // their own writes), when (verdicts expire after 7 days: tests read the clock), its tier, and for a
 // timing the duration it replaced.
 
-/** `trusted`, `pr-<n>`, `session-<id>` or `local-<id>`. */
+/** `trusted`, `fleet`, `pr-<n>`, `session-<id>` or `local-<id>`. */
 export type Tier = string;
 
 export interface Verdict {
@@ -39,10 +39,14 @@ const clean = (text: string) => text.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 6
 
 /**
  * Pure: this run's tier. `trusted` only for a GitHub Actions run of a push, schedule or manual
- * dispatch on the trusted ref; a pull request's run `pr-<n>`; a session (`OUTRUN_SESSION`) or any
+ * dispatch on the trusted ref; an `outrun run` cell `fleet`; a pull request's run `pr-<n>`; a session (`OUTRUN_SESSION`) or any
  * other CI run `session-<id>`; anything else `local-<host>`.
  */
 export const tierOf = (env: Env, trustedRef: string, host: string): Tier => {
+  // A cell of `outrun run` (OUTRUN_RUN): a patch nobody pushed, whatever ref it names. Every presubmit
+  // of the repository shares `fleet` (agent, Gabin delegated, overnight, 2026-11-10: "Option A");
+  // the remote cache writes it in its tier ci (control-plane cache-token.ts).
+  if (env.OUTRUN_RUN === "true") return "fleet";
   if (env.GITHUB_ACTIONS === "true") {
     const pr = /^refs\/pull\/(\d+)\//.exec(env.GITHUB_REF ?? "");
     if (pr) return `pr-${pr[1]}`;

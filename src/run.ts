@@ -100,6 +100,8 @@ export interface Context {
   readonly repository: string;
   readonly ref: string;
   readonly inputs: Readonly<Record<string, Value>>;
+  /** Given to every step of every cell, over GitHub's: the run's verdict cache (cacheEnvOf). */
+  readonly env?: Readonly<Record<string, string>>;
 }
 
 // What GitHub gives every job (contexts github and runner, the env of every step), for a dispatch.
@@ -210,7 +212,7 @@ export const runWorkflow = <R>(
               }
               const refused = runsOnRefusal(resolveValue(job.raw["runs-on"], scope));
               if (refused) return yield* refuse(refused);
-              const { capped, ...compiled } = compileJob(workflow, job, scope, envOf(github));
+              const { capped, ...compiled } = compileJob(workflow, job, scope, { ...envOf(github), ...context.env });
               if (capped && index === 0)
                 yield* print(
                   `- ${job.id}: timeout-minutes ${capped.minutes}${capped.byDefault ? " (GitHub's default)" : ""} is over outrun's cap: ${RUN_MAX_MINUTES} min`,
@@ -416,6 +418,35 @@ export const prepare = (path: string, text: string, named: readonly string[], fi
     return { workflow: parsed.workflow, jobs: selected.jobs, inputs: inputs.inputs };
   });
 
+/**
+ * What a cell needs to replay and record verdicts (OUT-56): OUTRUN_RUN (its tier is `fleet`,
+ * verdict.ts), and the verdict cache with a token the control plane mints for this run
+ * (control-plane cache-token.ts). Without a token, the cells keep to their machine's cache: slower,
+ * never wrong.
+ */
+const cacheEnvOf = (api: string, installation: string, token: string, repository: string) =>
+  Effect.gen(function* () {
+    const url = (process.env.OUTRUN_CACHE_URL ?? "https://cache.outrun.sh").replace(/\/$/, "");
+    const answer = yield* Effect.tryPromise({
+      try: async (signal) => {
+        const response = await fetch(`${api}/v1/installations/${installation}/cache-token`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify({ repo: repository }),
+          signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+        });
+        return { status: response.status, body: (await response.json().catch(() => ({}))) as { token?: unknown; refused?: unknown } };
+      },
+      catch: (cause) => String(cause),
+    }).pipe(Effect.result);
+    const minted = answer._tag === "Success" && typeof answer.success.body.token === "string" ? answer.success.body.token : undefined;
+    if (!minted)
+      yield* Console.error(
+        `outrun run: no verdict cache for the cells (${answer._tag === "Failure" ? answer.failure : `${answer.success.status} ${String(answer.success.body.refused ?? "")}`.trim()})`,
+      );
+    return { OUTRUN_RUN: "true", ...(minted ? { OUTRUN_CACHE_URL: url, OUTRUN_CACHE_TOKEN: minted } : {}) };
+  });
+
 const handler = ({
   workflow: name,
   job,
@@ -446,7 +477,8 @@ const handler = ({
     const api = process.env.OUTRUN_API ?? "https://api.outrun.sh";
     const githubToken = process.env.OUTRUN_GITHUB_TOKEN || undefined;
     if (!githubToken) yield* Console.error("outrun run: OUTRUN_GITHUB_TOKEN is not set: the warm checkouts stay at the commit the Minis' mirrors have");
-    const tree = yield* treeOf(ref || undefined);
+    // The run's cache token while the tree is read: no time on the run's path.
+    const [cacheEnv, tree] = yield* Effect.all([cacheEnvOf(api, id, token, repository), treeOf(ref || undefined)], { concurrency: 2 });
     const branch = spawnSync("git", ["symbolic-ref", "-q", "HEAD"], { encoding: "utf8" }).stdout.trim() || "refs/heads/main";
     return yield* Effect.gen(function* () {
       const repo = yield* Repo;
@@ -463,7 +495,14 @@ const handler = ({
       const known = yield* loadCells(dir).pipe(Effect.catchTag("FileFailed", () => Effect.succeed<Cells>({})));
       const cells = Object.fromEntries(jobs.flatMap((j) => (known[key(j.id)] ? [[j.id, known[key(j.id)]!]] : [])));
       const cellsOf = yield* fleet(repository, patchOf, repo.messageFrom, base, baseCommit?.status === 0 ? baseCommit.stdout : undefined, cells);
-      const results = yield* runWorkflow(workflow, jobs, { repository, ref: branch, inputs }, cellsOf.runCell, (line) => Console.log(line), cellsOf.ahead).pipe(
+      const results = yield* runWorkflow(
+        workflow,
+        jobs,
+        { repository, ref: branch, inputs, env: cacheEnv },
+        cellsOf.runCell,
+        (line) => Console.log(line),
+        cellsOf.ahead,
+      ).pipe(
         Effect.ensuring(
           cellsOf.close.pipe(
             Effect.flatMap((learned) =>

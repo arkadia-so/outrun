@@ -196,6 +196,29 @@ describe("outrun test --e2e", () => {
   );
 
   it.effect(
+    "replays and keeps the listing across runs whose sources read the run's own id (GITHUB_RUN_ID)",
+    () =>
+      Effect.gen(function* () {
+        const s = yield* setup();
+        // A fixture names its data after the run (a telemetry test's unique id, say).
+        yield* io(() => Bun.write(`${s.dir}/web/e2e/fixture.ts`, "export const id = process.env.GITHUB_RUN_ID + process.env.RUNNER_NAME;\n"));
+        git(s.dir, "add", ".");
+        git(s.dir, "commit", "-qm", "fixture");
+        const out = `${s.state}/plan.json`;
+        const runners = { max: 16, targetMs: 300_000, startMs: 60_000, slots: 1 };
+        const once = { GITHUB_RUN_ID: "1001", RUNNER_NAME: "outrun-a" };
+        const again = { GITHUB_RUN_ID: "1002", GITHUB_RUN_ATTEMPT: "2", RUNNER_NAME: "outrun-b" };
+        const first = yield* plan({ ...options(s, "g1", once), out, runners });
+        // Another run of the same commit, on another runner: its listing is kept, and its keys are the same.
+        const cached = yield* planCached({ ...options(s, "g2", again), out, runners });
+        expect(cached?.units.map((u) => u.key)).toEqual(first.units.map((u) => u.key));
+        expect((yield* outrunTest(options(s, "g1", once))).ran).toBe(2);
+        expect((yield* outrunTest(options(s, "g2", again))).replayed).toBe(2);
+      }),
+    60_000,
+  );
+
+  it.effect(
     "reruns every test of the suite when the app built for it changes (OUTRUN_E2E_APP)",
     () =>
       Effect.gen(function* () {

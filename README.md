@@ -157,6 +157,21 @@ after it). A job can also skip the plan: `outrun lookup <name>` answers for one 
 `outrun record <name> --failed`, so the known failure replays until its inputs change instead of
 costing its run every time.
 
+## Units a script runs itself
+
+A CI script that runs its own units (a Dart test file, a backend package) uses the verdict cache
+without outrun.json: `outrun verdicts lookup <spec.json|->` reads `{"units": [{"id", "run",
+"inputs": [globs from the root], "env"?: [names]}]}` and prints `{"tier", "units": [{"id", "key",
+"inputs", "hit"}]}`; the script runs the units that miss, then `outrun verdicts record
+<passes.json|->` writes `{"passes": [{"id", "key", "durationMs"}]}` under the keys the lookup gave.
+Each unit is keyed as a command unit: the machine, its keyed variables, `run` (put the command and
+its toolchain's version there) and the content of its inputs. A unit's key is only as good as its
+inputs: with no tracer for the language, give the inputs conservatively. A Dart test file, for
+example: the file, its package's whole `lib/` and `pubspec.lock`, and in `run` the Flutter version.
+It reruns more than it must (any change to `lib/` reruns the package's every test) and never
+replays a test whose imports changed, as long as it imports only its own package and the
+lockfile's. A path dependency of the package goes in the inputs too.
+
 ## Nx repositories
 
 A repository on Nx keeps Nx as its task runner. `outrun nx-cache --port 7070` serves Nx's self-hosted remote cache API (Nx 20.8+) on `127.0.0.1` and stores each archive in outrun's cache, in the scope the job's token gives it. Start it in the background, then set `NX_SELF_HOSTED_REMOTE_CACHE_SERVER=http://127.0.0.1:7070`. A cache that cannot answer is a miss: Nx runs the task. A refused write is logged and answered as stored, since Nx fails the task on any other answer.

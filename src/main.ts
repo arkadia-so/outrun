@@ -10,6 +10,9 @@ import { appendFile } from "node:fs/promises";
 //   outrun lookup <command>   (GitHub outputs run, key)
 //   outrun record <command> [--key k] [--since epoch-seconds] [--no-write] [--failed]
 //                                the command unit's step passed: write its pass
+//   outrun verdicts lookup <spec.json|->   units a script runs itself: {units: [{id, run, inputs}]} in,
+//                                {tier, units: [{id, key, inputs, hit}]} out
+//   outrun verdicts record <passes.json|-> [--no-write]   their passes: {passes: [{id, key, durationMs}]}
 //   outrun units [--json]        every unit, its key and how many files its key holds
 //   --e2e (plan, test, units)    no outrun.json: the checkout's TesterArmy e2e configs are the suites
 //   outrun e2e-app-key --build <cmd> --inputs <glob>... [--cache <path>]...
@@ -33,7 +36,7 @@ import { appendFile } from "node:fs/promises";
 // URL). Without a URL, only this machine's cache.
 import { BunServices } from "@effect/platform-bun";
 import { runMain } from "@effect/platform-bun/BunRuntime";
-import { Console, Effect, Exit, Option, Runtime } from "effect";
+import { Console, Effect, Exit, Option, Runtime, Schema } from "effect";
 import { Argument, CliError, Command, Flag } from "effect/cli";
 import pkg from "../package.json" with { type: "json" };
 import { BAZEL, buildCacheApp, NX } from "./build-cache.ts";
@@ -41,11 +44,11 @@ import { githubOidc } from "./cache.ts";
 import { checkCommand } from "./check.ts";
 import { appKey, buildCacheEntry } from "./discover.ts";
 import { e2eEnvLines } from "./e2e-env.ts";
-import { blocking, keyUnits, lookupCommand, plan, planCached, recordCommand, test } from "./engine.ts";
+import { blocking, keyUnits, lookupCommand, lookupVerdicts, plan, planCached, recordCommand, recordVerdicts, test } from "./engine.ts";
 import { CacheUnavailable, FileFailed, TestsFailed, UsageInvalid } from "./errors.ts";
 import * as Git from "./git.ts";
 import { mergeJunit, parseJunit } from "./junit.ts";
-import { machineFingerprint } from "./machine.ts";
+import { hashedEnv, keyedEnv, machineFingerprint } from "./machine.ts";
 import { runCommand } from "./run.ts";
 import { restoreEntry, saveEntry } from "./tier.ts";
 import type { Remote } from "./upstream.ts";
@@ -240,6 +243,12 @@ const unitsCommand = Command.make(
                 suite: u.suite.name,
                 key: u.key,
                 weak: u.weak,
+                // What the weak key holds, to compare two runners' keys of one unit (a variable by its digest).
+                runner: u.runner,
+                file: u.file,
+                toolchain: keyed.toolchains[u.runner] ?? "",
+                env: [...keyedEnv(env, [...(keyed.config.env ?? []), ...(u.suite.env ?? [])]), ...hashedEnv(env, u.suite.hashedEnv ?? [])],
+                suiteDigest: u.suiteDigest,
                 candidates: u.candidates.length,
                 inputs: u.inputs,
                 cacheable: u.cacheable,
@@ -401,6 +410,84 @@ const tierSaveCommand = Command.make("save", { file: Argument.String("file"), en
   }),
 ).pipe(Command.withDescription("Saves a file as an entry of the job's own cache tier, promoted to the tier after the job"));
 
+// `outrun verdicts`: the cache for units a script runs itself (OUT-56: a presubmit's Dart files and
+// backend packages), each a command unit given in JSON rather than in outrun.json.
+const VerdictsSpec = Schema.Struct({
+  units: Schema.Array(
+    Schema.Struct({
+      id: Schema.String,
+      /** Part of the key: the command the script runs and its toolchain's version. */
+      run: Schema.String,
+      /** Globs from the root whose content is the key (`!glob` excludes). */
+      inputs: Schema.Array(Schema.String),
+      env: Schema.optional(Schema.Array(Schema.String)),
+    }),
+  ),
+  trustedRef: Schema.optional(Schema.String),
+});
+const VerdictsPasses = Schema.Struct({
+  passes: Schema.Array(Schema.Struct({ id: Schema.String, key: Schema.String, durationMs: Schema.Finite })),
+  trustedRef: Schema.optional(Schema.String),
+});
+const readJson = <S extends Schema.Top>(schema: S, path: string) =>
+  Effect.gen(function* () {
+    const text = yield* Effect.tryPromise({
+      try: () => (path === "-" ? Bun.stdin.text() : Bun.file(path).text()),
+      catch: () => new FileFailed({ message: `${path}: unreadable` }),
+    });
+    return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(schema))(text).pipe(
+      Effect.mapError((e) => new UsageInvalid({ message: `${path}: ${e.message}` })),
+    );
+  });
+
+const verdictsLookupCommand = Command.make(
+  "lookup",
+  { spec: Argument.String("spec").pipe(Argument.withDescription("{units: [{id, run, inputs}]} as JSON, a file or - for stdin")), local },
+  (flags) =>
+    Effect.gen(function* () {
+      const spec = yield* readJson(VerdictsSpec, flags.spec);
+      const result = yield* lookupVerdicts({
+        cwd: process.cwd(),
+        env,
+        remote: yield* remoteOf(flags.local),
+        commands: spec.units.map((u) => ({ name: u.id, run: u.run, inputs: u.inputs, ...(u.env ? { env: u.env } : {}) })),
+        runId: runIdOf(),
+        ...(spec.trustedRef ? { trustedRef: spec.trustedRef } : {}),
+      });
+      yield* Console.log(JSON.stringify(result));
+      const hits = result.units.filter((u) => u.hit).length;
+      yield* Console.error(`outrun: ${result.units.length} units, ${hits} hit, ${result.units.length - hits} to run (tier ${result.tier})`);
+    }),
+).pipe(Command.withDescription("Whether each unit a script runs has a cached pass: prints {tier, units: [{id, key, inputs, hit}]}"));
+
+const verdictsRecordCommand = Command.make(
+  "record",
+  {
+    passes: Argument.String("passes").pipe(Argument.withDescription("{passes: [{id, key, durationMs}]} as JSON, a file or - for stdin")),
+    noWrite: Flag.Boolean("no-write").pipe(Flag.withDescription("never write the remote cache"), Flag.withDefault(false)),
+    local,
+  },
+  (flags) =>
+    Effect.gen(function* () {
+      const given = yield* readJson(VerdictsPasses, flags.passes);
+      const result = yield* recordVerdicts({
+        cwd: process.cwd(),
+        env,
+        remote: yield* remoteOf(flags.local),
+        passes: given.passes,
+        runId: runIdOf(),
+        write: !flags.noWrite,
+        ...(given.trustedRef ? { trustedRef: given.trustedRef } : {}),
+      });
+      yield* Console.error(`outrun: ${result.recorded} pass(es) recorded (tier ${result.tier}${result.refused ? `, ${result.refused} refused remotely` : ""})`);
+    }),
+).pipe(Command.withDescription("Write the passes of units a script ran, under the keys `outrun verdicts lookup` gave"));
+
+const verdictsCommand = Command.make("verdicts").pipe(
+  Command.withDescription("The verdict cache for units a script runs itself (a test file, a package): lookup, then record the passes"),
+  Command.withSubcommands([verdictsLookupCommand, verdictsRecordCommand]),
+);
+
 const tierCommand = Command.make("tier").pipe(
   Command.withDescription("Files in the job's cache tiers on outrun's Mac runners ($OUTRUN_CACHE, $OUTRUN_CACHE_PROTECTED)"),
   Command.withSubcommands([tierRestoreCommand, tierSaveCommand]),
@@ -421,6 +508,7 @@ const outrun = Command.make("outrun").pipe(
     e2eEnvCommand,
     e2eAppKeyCommand,
     tierCommand,
+    verdictsCommand,
     checkCommand,
     runCommand,
   ]),

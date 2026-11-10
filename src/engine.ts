@@ -15,7 +15,7 @@ import { vitestAdapter } from "./adapters/vitest.ts";
 import { xcodeAdapter } from "./adapters/xcode.ts";
 import { batches, expectedDurations, fillIdle, runnersFor, shard, UNKNOWN_MS } from "./balance.ts";
 import { type CacheEntry, divergenceKey, LocalCache, type Put, put, quarantineKey, query, timingKey } from "./cache.ts";
-import { type Config, loadConfig, type Suite } from "./config.ts";
+import { type CommandUnit, type Config, loadConfig, type Suite } from "./config.ts";
 import { discoverE2e } from "./discover.ts";
 import { FileFailed, UsageInvalid } from "./errors.ts";
 import { exec } from "./exec.ts";
@@ -73,6 +73,8 @@ export interface KeyOptions {
   readonly only?: readonly string[] | undefined;
   /** With `e2e`: never run e2e's CLI, only use the kept listings (discover.ts; the plan before an install). */
   readonly cachedListings?: boolean | undefined;
+  /** The command units, given by the caller (`outrun verdicts`): no outrun.json is read. */
+  readonly commands?: readonly CommandUnit[] | undefined;
 }
 
 export interface PlanOptions extends KeyOptions {
@@ -144,11 +146,13 @@ export const keyUnits = (options: KeyOptions) =>
   Effect.gen(function* () {
     const t0 = now();
     const repo = yield* Git.root(options.cwd);
-    const [loaded, blobs] = options.e2e
-      ? [undefined, withoutOwn(yield* Git.blobs(repo), repo, options.cwd, options.own ?? [])]
-      : yield* Effect.all([loadConfig(options.config ?? `${repo}/outrun.json`), Git.blobs(repo)], { concurrency: 2 }).pipe(
-          Effect.map(([config, all]) => [config, withoutOwn(all, repo, options.cwd, options.own ?? [])] as const),
-        );
+    const [loaded, blobs] = options.commands
+      ? [{ suites: [], commands: options.commands } as Config, withoutOwn(yield* Git.blobs(repo), repo, options.cwd, options.own ?? [])]
+      : options.e2e
+        ? [undefined, withoutOwn(yield* Git.blobs(repo), repo, options.cwd, options.own ?? [])]
+        : yield* Effect.all([loadConfig(options.config ?? `${repo}/outrun.json`), Git.blobs(repo)], { concurrency: 2 }).pipe(
+            Effect.map(([config, all]) => [config, withoutOwn(all, repo, options.cwd, options.own ?? [])] as const),
+          );
     const state = stateDir(options.env);
     // An unreadable scan cache is rebuilt: it only saves reading files again.
     const scans = yield* loadScans(state).pipe(Effect.catchTag("FileFailed", () => Effect.succeed(new Map<string, readonly string[] | null>())));
@@ -926,4 +930,66 @@ export const recordCommand = (
     yield* Console.error(
       `outrun: ${command.name} ${options.failed ? "failed (quarantined, recorded)" : "passed"} (${command.inputs === undefined ? "the given key" : `${command.inputs} inputs`}, tier ${tier})`,
     );
+  });
+
+/**
+ * `outrun verdicts lookup`: whether each unit a script runs itself (a Dart test file, a backend
+ * package) has a cached pass, without outrun.json. Each unit is a command unit given by the caller:
+ * its key holds the machine, its `run` (the script's command and its toolchain's version) and the
+ * content of its input globs. The caller runs the misses and records their passes (`recordVerdicts`)
+ * under the keys given here.
+ */
+export const lookupVerdicts = (options: KeyOptions & { readonly commands: readonly CommandUnit[]; readonly runId: string; readonly trustedRef?: string }) =>
+  Effect.gen(function* () {
+    const keyed = yield* keyUnits({ ...options, commandsOnly: true });
+    const tier = tierOf(options.env, options.trustedRef ?? "refs/heads/main", hostname());
+    const local = new LocalCache(`${keyed.state}/verdicts`);
+    const looked = yield* lookup([], keyed.commands, {}, local, options.remote, options.runId, tier);
+    return { tier, units: keyed.commands.map((c) => ({ id: c.name, key: c.key, inputs: c.inputs, hit: looked.commandHits.has(c.key) })) };
+  });
+
+/** `outrun verdicts record`: the passes of units a script ran, under the keys `lookupVerdicts` gave. */
+export const recordVerdicts = (
+  options: Pick<KeyOptions, "cwd" | "env" | "remote"> & {
+    readonly passes: readonly { readonly id: string; readonly key: string; readonly durationMs: number }[];
+    readonly runId: string;
+    readonly write: boolean;
+    readonly trustedRef?: string;
+  },
+) =>
+  Effect.gen(function* () {
+    const bad = options.passes.find((p) => !/^[0-9a-f]{64}$/.test(p.key));
+    if (bad) return yield* new UsageInvalid({ message: `${bad.id}: ${bad.key} is not a key` });
+    const repo = yield* Git.root(options.cwd);
+    const tier = tierOf(options.env, options.trustedRef ?? "refs/heads/main", hostname());
+    const at = Math.floor(Date.now() / 1000);
+    const commit = yield* Git.head(repo);
+    const producer = { commit, runner: options.env.RUNNER_NAME ?? hostname(), image: options.env.OUTRUN_IMAGE ?? options.env.ImageOS ?? "" };
+    const tag = formatTag({ run: options.runId, at, tier });
+    const local = new LocalCache(`${stateDir(options.env)}/verdicts`);
+    yield* local
+      .set(new Map(options.passes.map((p) => [p.key, { durationMs: p.durationMs, tag }])))
+      .pipe(Effect.catchTag("FileFailed", (e) => Console.error(`outrun: ${e.message}`)));
+    let refused = 0;
+    if (options.remote && options.write && options.passes.length > 0) {
+      const answer = yield* put(
+        options.remote,
+        options.passes.map((p) => {
+          const verdict: Verdict = {
+            v: 1,
+            unit: `command:${p.id}`,
+            key: p.key,
+            outcome: "pass",
+            durationMs: Math.round(p.durationMs),
+            producedAt: new Date(at * 1000).toISOString(),
+            tier,
+            producer,
+          };
+          return { hash: p.key, body: JSON.stringify(verdict), durationMs: p.durationMs, tag };
+        }),
+      );
+      refused = answer.count;
+      if (answer.count > 0) yield* Console.error(`outrun: the remote cache refused ${answer.count} pass(es) (${answer.statuses})`);
+    }
+    return { tier, recorded: options.passes.length, refused };
   });

@@ -17,7 +17,10 @@
 // a digest of each variable the folder's sources read by name (`process.env.OUTRUN_E2E_URL`): an end
 // to end test reaches a deployed app, which the variables name. Its batches get the job's whole
 // environment (the tests' secrets), retry as the config says (no rerun alone), and a pass replays for
-// a day only, since the app under test may change without a commit here. OUTRUN_E2E_APP, the key of
+// a day only, since the app under test may change without a commit here. The variables that only name
+// the run, its job or its machine (RUN_IDENTITY: GITHUB_RUN_ID, RUNNER_NAME...) are never keyed, even
+// when a source reads them: a test reads them to make unique names (a fixture's id), and keying them
+// made every run's keys, and its listing's, new, so nothing ever replayed (OUT-56, 2026-11-11). OUTRUN_E2E_APP, the key of
 // the app the workflow built for a device target (its `build` input), is one of those variables: a
 // new build of the app reruns its tests.
 //
@@ -55,6 +58,36 @@ const TEST_NAME = /(^|\/)(e2e|tests?)\/|\.(e2e|test|spec)\.[^/]*$/;
 const APP_ENV = "OUTRUN_E2E_APP";
 /** The variable holding e2e's selection flags (e2e.yml `filter`). */
 const FILTER_ENV = "OUTRUN_E2E_FILTER";
+/**
+ * Variables that name the run, its job, its runner or its machine, never what is under test: a source
+ * reading one (a unique fixture name from GITHUB_RUN_ID) keys nothing on it, else no run would ever
+ * replay another's verdicts.
+ */
+const RUN_IDENTITY = new Set([
+  "GITHUB_RUN_ID",
+  "GITHUB_RUN_ATTEMPT",
+  "GITHUB_RUN_NUMBER",
+  "GITHUB_JOB",
+  "GITHUB_ACTION",
+  "GITHUB_ACTION_PATH",
+  "GITHUB_WORKSPACE",
+  "GITHUB_ENV",
+  "GITHUB_OUTPUT",
+  "GITHUB_PATH",
+  "GITHUB_STATE",
+  "GITHUB_STEP_SUMMARY",
+  "GITHUB_EVENT_PATH",
+  "GITHUB_SHA",
+  "GITHUB_TOKEN",
+  "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+  "ACTIONS_ID_TOKEN_REQUEST_URL",
+  "ACTIONS_RUNTIME_TOKEN",
+  "RUNNER_NAME",
+  "RUNNER_TEMP",
+  "RUNNER_TRACKING_ID",
+  "OUTRUN_RUN_ID",
+  "HOSTNAME",
+]);
 /** e2e's selection flags, each followed by its value. */
 const FILTER_FLAGS = new Set(["--tag", "--tag-mode", "--exclude-tag", "--grep", "--grep-invert", "--target"]);
 
@@ -309,7 +342,7 @@ export const discoverE2e = (repo: string, blobs: Blobs, env: Env, listings: List
           const prefix = dir === "." ? "" : `${dir}/`;
           const folder = [...blobs.keys()].filter((p) => p.startsWith(prefix) && !p.split("/").includes("node_modules"));
           const names = new Set<string>([APP_ENV]);
-          for (const p of folder) if (SOURCE.test(p)) for (const n of envNames(readText(`${repo}/${p}`))) names.add(n);
+          for (const p of folder) if (SOURCE.test(p)) for (const n of envNames(readText(`${repo}/${p}`))) if (!RUN_IDENTITY.has(n)) names.add(n);
           const closure = listings.graph.closure([path]);
           const key = listingKey({
             path,
