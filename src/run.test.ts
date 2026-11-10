@@ -10,6 +10,7 @@ import * as Exit from "effect/Exit";
 import { afterAll, describe, expect, it } from "vitest";
 import { NotRun } from "./check.ts";
 import { condition, evaluate, interpolate, parse } from "./expr.ts";
+import { basePrelude } from "./job-script.ts";
 import { type Cell, prepare, type Ran, runWorkflow } from "./run.ts";
 import { expandMatrix, parseWorkflow } from "./workflow.ts";
 
@@ -352,4 +353,58 @@ jobs:
     );
     expect(Exit.isFailure(exit) && exit.cause.reasons.some((r) => r._tag === "Fail" && (r.error as { _tag: string })._tag === "NotRun")).toBe(true);
   });
+});
+
+describe("the run's checkout on a VM", () => {
+  const git = (cwd: string, ...args: string[]) => {
+    const r = spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", ...args], { cwd, encoding: "utf8" });
+    if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+  const sh = (cwd: string, script: string) => spawnSync("bash", ["-c", script], { cwd, encoding: "utf8" });
+  // A commit object as the CLI reads it, its last newline kept (it is part of the object).
+  const raw = (cwd: string, rev: string) => spawnSync("git", ["cat-file", "commit", rev], { cwd, encoding: "utf8" }).stdout;
+
+  it("holds the push's base under its own sha as HEAD's parent, as GitHub's checkout of the pushed commit", () => {
+    const root = mkdtempSync(join(tmpdir(), "outrun-base-"));
+    try {
+      // The caller: main W, then X, the push's base B, the push H. The VM: its warm commit (W's tree),
+      // the base's tree committed on it, then H's tree (the agent's changeCommits); X and B absent.
+      const caller = join(root, "caller");
+      const vm = join(root, "vm");
+      for (const dir of [caller, vm]) sh(root, `mkdir ${dir} && git -C ${dir} init -q`);
+      const commit = (dir: string, script: string, message: string) => {
+        sh(dir, script);
+        git(dir, "add", "-A");
+        git(dir, "commit", "-qm", message);
+      };
+      commit(caller, "echo w > f", "W");
+      commit(caller, "echo x > x", "X");
+      commit(caller, "echo b >> f", "B");
+      const base = git(caller, "rev-parse", "HEAD");
+      commit(caller, "echo h > h", "H");
+      commit(vm, "echo w > f", "warm");
+      commit(vm, "echo x > x; echo b >> f", "outrun check: the push's base");
+      commit(vm, "echo h > h", "the push");
+      const tree = git(vm, "rev-parse", "HEAD^{tree}");
+
+      const ran = sh(vm, basePrelude(base, raw(caller, base)));
+      expect(ran.stderr).toBe("");
+      expect(ran.status).toBe(0);
+      expect(git(vm, "rev-parse", "HEAD~1")).toBe(base);
+      expect(git(vm, "merge-base", base, "HEAD")).toBe(base);
+      expect(git(vm, "diff", "--name-only", base, "HEAD")).toBe("h");
+      expect(git(vm, "rev-parse", "HEAD^{tree}")).toBe(tree);
+      expect(git(vm, "status", "--porcelain")).toBe("");
+
+      // Another base's tree than HEAD~1's: the checkout stays, and says so.
+      const head = git(vm, "rev-parse", "HEAD");
+      const other = sh(vm, basePrelude(git(caller, "rev-parse", "HEAD~2"), raw(caller, "HEAD~2")));
+      expect(other.stderr).toContain("is not in this checkout");
+      expect(git(vm, "rev-parse", "HEAD")).toBe(head);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    // About 25 git processes: past vitest's 5 s when the whole suite loads the machine.
+  }, 30_000);
 });

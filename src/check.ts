@@ -374,6 +374,17 @@ export const changeMessage = (bodies: string, trailers: string) => {
   return `${body.slice(0, Math.max(0, MESSAGE_MAX_CHARS - block.length - 2))}\n\n${block}`.slice(0, MESSAGE_MAX_CHARS);
 };
 
+// The body of a check's patch. `patch`, the check's own commit's, for a control plane before 1.6,
+// which reads no `patches`; `patches` whenever a worker starts from another commit than the check's
+// (`outrun run`'s one worker may, with no patch on the check's own commit: the control plane then
+// answered 404). `change`: ignored by a control plane before 1.8, whose VMs plan against the warm's commit.
+export const patchBody = (sha: string, patches: Readonly<Record<string, string>>, message: string, change?: string) => ({
+  patch: patches[sha] ?? "",
+  ...(Object.keys(patches).some((other) => other !== sha) ? { patches } : {}),
+  message,
+  ...(change === undefined ? {} : { change }),
+});
+
 export const checkApiLive = (api: string, installation: string, token: string, githubToken: string | undefined) => {
   const base = `${api}/v1/installations/${installation}/checks`;
   const request = (path: string, init: { method: string; body?: unknown; headers?: Record<string, string> }, timeoutMs = 30_000) =>
@@ -407,14 +418,8 @@ export const checkApiLive = (api: string, installation: string, token: string, g
         body: { protocol: CHECK_PROTOCOL, repo, workers, bases: true, ...(run ? { run: true } : {}) },
         ...(githubToken ? { headers: { "x-github-token": githubToken } } : {}),
       }).pipe(Effect.map((body) => body as unknown as Created)),
-    // `patch`, the check's own base's, for a control plane before 1.6, which reads no `patches`.
-    // `patches` only when the workers start from several commits.
-    // `change`: ignored by a control plane before 1.8, whose VMs plan against the warm's commit.
     patch: (id, sha, patches, message, change) =>
-      request(`/${id}/patch`, {
-        method: "POST",
-        body: { patch: patches[sha] ?? "", ...(Object.keys(patches).length > 1 ? { patches } : {}), message, ...(change === undefined ? {} : { change }) },
-      }).pipe(Effect.asVoid),
+      request(`/${id}/patch`, { method: "POST", body: patchBody(sha, patches, message, change) }).pipe(Effect.asVoid),
     shards: (id, shards) => request(`/${id}/shards`, { method: "POST", body: { shards } }).pipe(Effect.asVoid),
     events: (id, after) =>
       request(`/${id}/events?after=${after}`, { method: "GET" }, 40_000).pipe(Effect.map((body) => (body.events ?? []) as readonly CheckEvent[])),

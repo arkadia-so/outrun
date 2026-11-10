@@ -10,6 +10,7 @@ import {
   MESSAGE_MAX_CHARS,
   NotRun,
   overTarget,
+  patchBody,
   Repo,
   runRepoCheck,
   splitUnits,
@@ -285,4 +286,12 @@ describe("outrun check", () => {
       expect(calls.at(-1)).toBe("end c");
     }),
   );
+});
+
+describe("the patch a check sends", () => {
+  it("names every warm commit's patch when a worker starts from another commit than the check's, even alone", () => {
+    expect(patchBody("aaaa", { aaaa: "on a" }, "m")).toEqual({ patch: "on a", message: "m" });
+    expect(patchBody("aaaa", { bbbb: "on b" }, "m", "c")).toEqual({ patch: "", patches: { bbbb: "on b" }, message: "m", change: "c" });
+    expect(patchBody("aaaa", { aaaa: "on a", bbbb: "on b" }, "m").patches).toEqual({ aaaa: "on a", bbbb: "on b" });
+  });
 });

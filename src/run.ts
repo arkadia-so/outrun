@@ -28,7 +28,7 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import { CheckApi, checkApiLive, NotRun, Repo, repoLive, treeOf, waitFor } from "./check.ts";
 import { condition, evaluate, interpolate, type Scope, truthy, type Value } from "./expr.ts";
-import { compileJob } from "./job-script.ts";
+import { basePrelude, compileJob } from "./job-script.ts";
 import {
   cellName,
   type Combination,
@@ -225,6 +225,8 @@ const fleetCell =
     patchOf: (sha: string) => Effect.Effect<string, NotRun>,
     message: (sha: string) => Effect.Effect<string, NotRun>,
     base: { sha: string; change: string } | undefined,
+    // The base's commit object, which the cell's checkout gets back (job-script.ts basePrelude).
+    baseCommit: string | undefined,
   ): RunCell<CheckApi> =>
   (cell) =>
     Effect.gen(function* () {
@@ -242,7 +244,14 @@ const fleetCell =
         const ready = yield* waitFor(check.id, 0, (events) => events.some((e) => e.step === "apply"), t0 + READY_MS, t0);
         const broken = ready.events.find((e) => e.code !== 0);
         if (broken) return yield* new NotRun({ message: `${cell.name}: ${broken.worker} ${broken.step}: exit ${broken.code}: ${broken.log.slice(-500)}` });
-        yield* api.shards(check.id, [{ worker: 0, tasks: [cell.id], script: cell.script, timeoutMs: cell.timeoutMs }]);
+        yield* api.shards(check.id, [
+          {
+            worker: 0,
+            tasks: [cell.id],
+            script: base && baseCommit ? basePrelude(base.sha, baseCommit) + cell.script : cell.script,
+            timeoutMs: cell.timeoutMs,
+          },
+        ]);
         const sent = Date.now();
         const ran = yield* waitFor(check.id, ready.after, (events) => events.some((e) => e.step === "shard"), sent + cell.timeoutMs + RESULT_SLACK_MS, sent);
         const shard = ran.events.find((e) => e.step === "shard")!;
@@ -342,9 +351,14 @@ const handler = ({
       const patchOf = (sha: string) =>
         patches.has(sha) ? Effect.succeed(patches.get(sha)!) : repo.patchFrom(sha).pipe(Effect.tap((patch) => Effect.sync(() => patches.set(sha, patch))));
       const base = yield* repo.base;
+      const baseCommit = base ? spawnSync("git", ["cat-file", "commit", base.sha], { encoding: "utf8" }) : undefined;
       yield* Console.log(`outrun run: ${found.shown}: ${jobs.length} job(s) on ${repository}, the tree ${ref ? `of ${ref}` : "of HEAD with its changes"}`);
-      const results = yield* runWorkflow(workflow, jobs, { repository, ref: branch, inputs }, fleetCell(repository, patchOf, repo.messageFrom, base), (line) =>
-        Console.log(line),
+      const results = yield* runWorkflow(
+        workflow,
+        jobs,
+        { repository, ref: branch, inputs },
+        fleetCell(repository, patchOf, repo.messageFrom, base, baseCommit?.status === 0 ? baseCommit.stdout : undefined),
+        (line) => Console.log(line),
       );
       const failed = [...results].filter(([, r]) => r === "failure").map(([j]) => j);
       if (failed.length > 0) {

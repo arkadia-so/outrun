@@ -111,6 +111,26 @@ writeout() { printf '%s' "$2" > "./$1"; }
 record() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$OUTRUN_RUN_DIR/steps.tsv"; }
 `.replaceAll("$<", "${");
 
+/**
+ * The push's base in the run's checkout, as GitHub's checkout of the pushed commit has it. The VM
+ * commits the base's tree on its warm commit under another sha (outrun/mac agent `changeCommits`), so a
+ * workflow given the base's sha (`-f base=<sha>`) could not find it. This writes the base's own commit
+ * object (`raw`, `git cat-file commit <sha>` on the caller's side: the same sha), makes it a shallow
+ * boundary (its parents are not in the VM), and puts the run's tree on it: HEAD~1 is then the base
+ * itself, and `git diff`/`merge-base` against it see the push's change only. Done only when HEAD~1
+ * holds the base's tree; otherwise the checkout stays as it is, and says so.
+ */
+export const basePrelude = (sha: string, raw: string) => {
+  const commit = q(sha);
+  return `if outrun_base=$(echo ${Buffer.from(raw).toString("base64")} | base64 -d | git hash-object -t commit -w --stdin 2>/dev/null) && [ "$outrun_base" = ${commit} ] && [ "$(git rev-parse -q --verify 'HEAD~1^{tree}')" = "$(git rev-parse -q --verify ${q(`${sha}^{tree}`)})" ]; then
+  echo ${commit} >> "$(git rev-parse --git-path shallow)"
+  git reset -q --soft "$(git log -1 --format=%B HEAD | git -c user.name=outrun -c user.email=check@outrun.sh commit-tree 'HEAD^{tree}' -p ${commit} -F -)"
+else
+  echo ${q(`outrun: the push's base ${sha} is not in this checkout`)} >&2
+fi
+`;
+};
+
 export interface Compiled {
   readonly script: string;
   // The job's deadline (its timeout-minutes, else GitHub's default, 360).
