@@ -156,6 +156,12 @@ monorepo unless stated otherwise.
 
    The floor is then the slowest single unit: two of 13–17 s each in this case. `outrun check` names
    every unit alone over `--target`: split it or cache its output.
+
+   Since 1.9 the gate can be an ordinary workflow instead (a `presubmit.yml` with only
+   `workflow_dispatch`), run by the hook with `outrun run presubmit.yml` on the tree being pushed
+   (README, "outrun run"): nothing outrun-specific to write, and the same file runs on GitHub. Write
+   its jobs with `run:` steps and `actions/checkout` only (other actions are refused, exit 2), and
+   split it with a planning job whose output feeds a `fromJSON` matrix.
 6. **Large caches on the machine, not over the network.**
    - A signed iOS build restored 8 GB of Swift packages over the network. Its first runs on fresh
      machines took **505–1670 s** (the restore alone up to 1043 s).
@@ -207,6 +213,7 @@ monorepo unless stated otherwise.
 | Commit messages lost in `outrun check` | A plan that reads `git log "$OUTRUN_CHECK_BASE..HEAD"` (trailers, `[skip …]` flags) sees one commit named "outrun check". | Before outrun 1.5.3, the VM committed the patch with its own message. | Use `arkadia-so/outrun@v1`, or pin 1.5.3 or later. |
 | Too few workers for a wide check | A wide change plans 547 units. `outrun check --workers 4` prints `1 worker(s)`. The one shard (~500 s expected) is cut at ~240 s with `no answer in time`, three times. The push cannot land. | Fewer workers were free than asked for, and the share outran a time limit. | Any outcome other than a verdict, and any worker count below the request on a wide change, means "not run": run the check locally (exit 3 means the same). Name the units over `--target` and split them, so a wide change still fits on few workers. |
 | Slow pickup with idle capacity | "Set up runner" takes 46–126 s, or a job queues for minutes while others start at once. | On outrun's side, the scheduler was slow to hand out jobs. | Report the run id with each job's `created_at` and `started_at`. Do not work around it in the workflow. |
+| A slow video stop blamed on the codec | An iOS e2e test's video takes tens of seconds to stop on a macOS VM, and the recording's HEVC encoding is suspected. | Not the codec: a macOS VM on Apple silicon exposes paravirtualized hardware H.264 and HEVC encoders (VideoToolbox lists them), and `simctl io recordVideo` stops in 0.1–0.8 s with HEVC (0.4–1.2 s with H.264) after up to 240 s of recording, all CPUs busy. H.264 files are twice the size. | Keep HEVC (the default). Time the harness's own stop path (its recorder's request, the file checks after it) instead. |
 | Screenshots sent as text to the e2e model | Model calls of hundreds of thousands of tokens, 429s, context overflows, wrong answers about the screen. | An OpenAI-compatible provider writes an image in a tool result as JSON text, unless told otherwise. | Create the provider with `supportsMultiPartToolContent: true`, and honour `Retry-After` on 429 and 503. |
 
 ## 5. Who decides, and how to roll back

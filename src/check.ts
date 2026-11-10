@@ -20,6 +20,10 @@
 // private repository before building its warm checkout (used for that fetch only, never stored);
 // without it the warms stay at the commit their mirror has.
 import { spawn } from "node:child_process";
+import { rmSync } from "node:fs";
+import { copyFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import * as Command from "effect/cli/Command";
 import * as Flag from "effect/cli/Flag";
 import * as Console from "effect/Console";
@@ -70,18 +74,28 @@ export interface Created {
 export class CheckApi extends Context.Service<
   CheckApi,
   {
-    readonly create: (repo: string, workers: number) => Effect.Effect<Created, NotRun>;
+    // `run`: a job of `outrun run` (run.ts): its workers on Minis whose agent runs a job's script,
+    // and no worker plans.
+    readonly create: (repo: string, workers: number, run?: boolean) => Effect.Effect<Created, NotRun>;
     // `patches`: HEAD's tree as a patch on each warm commit the workers start from (by sha);
     // `message`: the commit messages of the change (Repo `messageFrom`), the VM's commit's;
     // `change`: the push's base to HEAD (Repo `base`), absent when the clone has no remote main.
     readonly patch: (id: string, sha: string, patches: Readonly<Record<string, string>>, message: string, change?: string) => Effect.Effect<void, NotRun>;
-    readonly shards: (id: string, shards: readonly { worker: number; tasks: readonly string[] }[]) => Effect.Effect<void, NotRun>;
+    // `script`, `timeoutMs`: a job of `outrun run`, its script run instead of the declaration's `run`.
+    readonly shards: (id: string, shards: readonly ShardRequest[]) => Effect.Effect<void, NotRun>;
     readonly events: (id: string, after: number) => Effect.Effect<readonly CheckEvent[], NotRun>;
     readonly end: (id: string) => Effect.Effect<void>;
   }
 >()("outrun/cli/CheckApi") {}
 
-// The local repository: its GitHub name, and HEAD's tree as a patch on a given commit.
+export interface ShardRequest {
+  readonly worker: number;
+  readonly tasks: readonly string[];
+  readonly script?: string;
+  readonly timeoutMs?: number;
+}
+
+// The local repository: its GitHub name, and the tree checked (HEAD's, or `repoLive`'s) as a patch on a given commit.
 export class Repo extends Context.Service<
   Repo,
   {
@@ -155,7 +169,7 @@ export const splitUnits = (units: readonly Unit[], n: number): string[][] => {
 };
 
 // The events until `done` says the check has what it waits for; a worker lost ends it.
-const waitFor = (id: string, from: number, done: (events: readonly CheckEvent[]) => boolean, deadline: number, since: number) =>
+export const waitFor = (id: string, from: number, done: (events: readonly CheckEvent[]) => boolean, deadline: number, since: number) =>
   Effect.gen(function* () {
     const api = yield* CheckApi;
     const seen: CheckEvent[] = [];
@@ -268,9 +282,9 @@ export const runRepoCheck = (workers: number, targetMs = 30_000, { slackMs = CHE
     }).pipe(Effect.ensuring(api.end(check.id)));
   });
 
-const exec = (program: string, args: readonly string[]) =>
+const exec = (program: string, args: readonly string[], env?: Readonly<Record<string, string>>) =>
   Effect.callback<string, NotRun>((resume) => {
-    const child = spawn(program, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(program, args, { stdio: ["ignore", "pipe", "pipe"], ...(env ? { env: { ...process.env, ...env } } : {}) });
     const out: Buffer[] = [];
     let err = "";
     child.stdout.on("data", (chunk: Buffer) => out.push(chunk));
@@ -283,33 +297,61 @@ const exec = (program: string, args: readonly string[]) =>
     );
   });
 
-const RepoLive = Layer.succeed(Repo, {
-  name: exec("git", ["remote", "get-url", "origin"]).pipe(
-    Effect.flatMap((url) => {
-      const match = /github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\s*$/.exec(url);
-      return match ? Effect.succeed(match[1]!) : Effect.fail(new NotRun({ message: `origin is not a GitHub repository: ${url.trim()}` }));
-    }),
-  ),
-  // The warm commit fetched if this clone lacks it; then HEAD's whole tree against it.
-  patchFrom: (sha) =>
-    exec("git", ["cat-file", "-e", `${sha}^{commit}`]).pipe(
-      Effect.catchTag("NotRun", () => exec("git", ["fetch", "-q", "origin", sha])),
-      Effect.andThen(exec("git", ["diff", "--binary", "--no-color", "--no-ext-diff", sha, "HEAD"])),
+// The tree a run checks: a commit (`--ref`), or HEAD with the working tree's changes, untracked files
+// included and ignored ones not, written as a tree object through a throwaway index (the real index
+// untouched).
+export const treeOf = (ref: string | undefined) =>
+  ref
+    ? exec("git", ["rev-parse", "--verify", `${ref}^{commit}`]).pipe(Effect.map((sha) => sha.trim()))
+    : Effect.gen(function* () {
+        const index = (yield* exec("git", ["rev-parse", "--path-format=absolute", "--git-path", "index"])).trim();
+        const scratch = join(tmpdir(), `outrun-index-${process.pid}-${Date.now()}`);
+        return yield* Effect.gen(function* () {
+          yield* Effect.tryPromise({ try: () => copyFile(index, scratch), catch: () => new NotRun({ message: `git's index not read: ${index}` }) }).pipe(
+            Effect.catchTag("NotRun", () => Effect.void),
+          );
+          const top = (yield* exec("git", ["rev-parse", "--show-toplevel"])).trim();
+          yield* exec("git", ["-C", top, "add", "-A"], { GIT_INDEX_FILE: scratch });
+          return (yield* exec("git", ["-C", top, "write-tree"], { GIT_INDEX_FILE: scratch })).trim();
+        }).pipe(Effect.ensuring(Effect.sync(() => rmSync(scratch, { force: true }))));
+      });
+
+// The local repository; `head`, the tree or commit checked (HEAD for `outrun check`).
+export const repoLive = (head = "HEAD") =>
+  Layer.succeed(Repo, {
+    name: exec("git", ["remote", "get-url", "origin"]).pipe(
+      Effect.flatMap((url) => {
+        const match = /github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\s*$/.exec(url);
+        return match ? Effect.succeed(match[1]!) : Effect.fail(new NotRun({ message: `origin is not a GitHub repository: ${url.trim()}` }));
+      }),
     ),
-  // After patchFrom, which fetched `sha` when this clone lacked it.
-  messageFrom: (sha) =>
-    Effect.all([
-      exec("git", ["log", "--no-merges", "--format=%B", `${sha}..HEAD`]),
-      exec("git", ["log", "--no-merges", "--format=%(trailers:only,unfold)", `${sha}..HEAD`]),
-    ]).pipe(Effect.map(([bodies, trailers]) => changeMessage(bodies, trailers))),
-  base: Effect.gen(function* () {
-    for (const ref of ["origin/HEAD", "origin/main", "origin/master"]) {
-      const sha = yield* exec("git", ["merge-base", "HEAD", ref]).pipe(Effect.catchTag("NotRun", () => Effect.succeed("")));
-      if (sha.trim()) return { sha: sha.trim(), change: yield* exec("git", ["diff", "--binary", "--no-color", "--no-ext-diff", sha.trim(), "HEAD"]) };
-    }
-    return undefined;
-  }),
-});
+    // The warm commit fetched if this clone lacks it; then the whole tree against it.
+    patchFrom: (sha) =>
+      exec("git", ["cat-file", "-e", `${sha}^{commit}`]).pipe(
+        Effect.catchTag("NotRun", () => exec("git", ["fetch", "-q", "origin", sha])),
+        Effect.andThen(exec("git", ["diff", "--binary", "--no-color", "--no-ext-diff", sha, head])),
+      ),
+    // After patchFrom, which fetched `sha` when this clone lacked it. The commits' messages: HEAD's
+    // when the tree is HEAD's with uncommitted changes.
+    messageFrom: (sha) => {
+      const tip = /^[0-9a-f]{40}$/.test(head) ? head : "HEAD";
+      return Effect.all([
+        exec("git", ["log", "--no-merges", "--format=%B", `${sha}..${tip}`]).pipe(
+          Effect.catchTag("NotRun", () => exec("git", ["log", "--no-merges", "--format=%B", `${sha}..HEAD`])),
+        ),
+        exec("git", ["log", "--no-merges", "--format=%(trailers:only,unfold)", `${sha}..${tip}`]).pipe(
+          Effect.catchTag("NotRun", () => exec("git", ["log", "--no-merges", "--format=%(trailers:only,unfold)", `${sha}..HEAD`])),
+        ),
+      ]).pipe(Effect.map(([bodies, trailers]) => changeMessage(bodies, trailers)));
+    },
+    base: Effect.gen(function* () {
+      for (const ref of ["origin/HEAD", "origin/main", "origin/master"]) {
+        const sha = yield* exec("git", ["merge-base", "HEAD", ref]).pipe(Effect.catchTag("NotRun", () => Effect.succeed("")));
+        if (sha.trim()) return { sha: sha.trim(), change: yield* exec("git", ["diff", "--binary", "--no-color", "--no-ext-diff", sha.trim(), head]) };
+      }
+      return undefined;
+    }),
+  });
 
 // The control plane's bound on a check's message (control-plane checks.ts MESSAGE_MAX_CHARS).
 export const MESSAGE_MAX_CHARS = 64 * 1024;
@@ -332,7 +374,7 @@ export const changeMessage = (bodies: string, trailers: string) => {
   return `${body.slice(0, Math.max(0, MESSAGE_MAX_CHARS - block.length - 2))}\n\n${block}`.slice(0, MESSAGE_MAX_CHARS);
 };
 
-const checkApiLive = (api: string, installation: string, token: string, githubToken: string | undefined) => {
+export const checkApiLive = (api: string, installation: string, token: string, githubToken: string | undefined) => {
   const base = `${api}/v1/installations/${installation}/checks`;
   const request = (path: string, init: { method: string; body?: unknown; headers?: Record<string, string> }, timeoutMs = 30_000) =>
     Effect.tryPromise({
@@ -358,11 +400,11 @@ const checkApiLive = (api: string, installation: string, token: string, githubTo
       ),
     );
   return Layer.succeed(CheckApi, {
-    create: (repo, workers) =>
+    create: (repo, workers, run) =>
       request("", {
         method: "POST",
         // `bases`: this CLI sends a patch for each warm commit, so workers may start from several.
-        body: { protocol: CHECK_PROTOCOL, repo, workers, bases: true },
+        body: { protocol: CHECK_PROTOCOL, repo, workers, bases: true, ...(run ? { run: true } : {}) },
         ...(githubToken ? { headers: { "x-github-token": githubToken } } : {}),
       }).pipe(Effect.map((body) => body as unknown as Created)),
     // `patch`, the check's own base's, for a control plane before 1.6, which reads no `patches`.
@@ -404,7 +446,7 @@ const handler = ({ workers, target, installation }: { readonly workers: number; 
     const api = process.env.OUTRUN_API ?? "https://api.outrun.sh";
     const githubToken = process.env.OUTRUN_GITHUB_TOKEN || undefined;
     if (!githubToken) yield* Console.error("outrun check: OUTRUN_GITHUB_TOKEN is not set: the warm checkouts stay at the commit the Minis' mirrors have");
-    return yield* runRepoCheck(workers, target * 1000).pipe(Effect.provide(Layer.merge(checkApiLive(api, id, token, githubToken), RepoLive)));
+    return yield* runRepoCheck(workers, target * 1000).pipe(Effect.provide(Layer.merge(checkApiLive(api, id, token, githubToken), repoLive())));
   });
 
 export const checkCommand = Command.make("check", flags, handler).pipe(

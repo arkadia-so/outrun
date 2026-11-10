@@ -302,6 +302,34 @@ const gateway = createOpenAICompatible({ name: "trait", baseURL: "https://ai.tra
 export default { /* tests, targets */ agents: { default: { model: gateway("fast") } } } satisfies E2EConfig;
 ```
 
+## outrun run: a workflow on outrun's VMs, from your tree
+
+`outrun run <workflow>` (since 1.9) runs one of the repository's GitHub Actions workflows on outrun's
+Linux VMs against your tree: HEAD with its uncommitted and untracked changes (or exactly a commit,
+`--ref <sha>`), sent as a patch, so GitHub never sees it. Each job's steps and log come back in the
+terminal. Nothing outrun-specific is configured: the workflow is the one GitHub runs.
+
+```sh
+OUTRUN_API_TOKEN=ort_... OUTRUN_INSTALLATION=<id> OUTRUN_GITHUB_TOKEN=<a token that reads the repo> \
+  outrun run presubmit.yml [--job <id>] [-f name=value]
+```
+
+- `<workflow>`: a path, or a file name in `.github/workflows`. `--job` runs one job and what it
+  `needs`; `-f` sets a `workflow_dispatch` input (types, defaults and `required` checked). `on:` is
+  not read: a run is a dispatch of the file.
+- It runs, as GitHub does: `needs`, `if:` (with `success()`, `failure()`, `always()`),
+  `strategy.matrix` (include, exclude, `fromJSON` of a job's output), `fail-fast`, `max-parallel`,
+  `timeout-minutes`, `continue-on-error`, `env`, `defaults.run`, `shell`, `working-directory`,
+  `GITHUB_ENV`, `GITHUB_OUTPUT`, `GITHUB_PATH`, step and job outputs, and `actions/checkout` of the
+  repository itself (the run's tree). A job without a checkout gets an empty workspace.
+- Anything it would run differently from GitHub is refused before anything runs (exit 2), naming
+  the feature, the file and the line: other actions (`uses:`), `services`, `container`,
+  `concurrency`, `environment`, `secrets`, `vars`, `github.token`, `hashFiles()`, checkout `ref` or
+  `path`, a macOS or Windows `runs-on`.
+- Exit 0: every job passed (or was skipped by its `if:`); 1: a job failed; 2: refused; 3: outrun did
+  not run it (unreachable, no warm checkout yet, no VM free, a worker lost): run it locally instead.
+  The repository must be listed in the installation's check settings.
+
 ## outrun check: the fast CI on outrun's VMs
 
 `outrun check` runs a repository's fast CI on the tree of HEAD (committed changes only) on outrun's

@@ -46,6 +46,7 @@ import { CacheUnavailable, FileFailed, TestsFailed, UsageInvalid } from "./error
 import * as Git from "./git.ts";
 import { mergeJunit, parseJunit } from "./junit.ts";
 import { machineFingerprint } from "./machine.ts";
+import { runCommand } from "./run.ts";
 import { restoreEntry, saveEntry } from "./tier.ts";
 import type { Remote } from "./upstream.ts";
 import { xcodeReads } from "./xcode-reads.ts";
@@ -421,6 +422,7 @@ const outrun = Command.make("outrun").pipe(
     e2eAppKeyCommand,
     tierCommand,
     checkCommand,
+    runCommand,
   ]),
 );
 
@@ -436,7 +438,9 @@ const main = Command.run(outrun, { version: pkg.version }).pipe(
     FileFailed: (e) => Console.error(`outrun: ${e.message}`).pipe(Effect.as(2)),
     UsageInvalid: (e) => Console.error(`outrun: ${e.message}`).pipe(Effect.as(2)),
     CheckFailed: () => Effect.succeed(1),
-    NotRun: (e) => Console.error(`outrun check: not run on the fleet: ${e.message}`).pipe(Effect.as(3)),
+    RunFailed: () => Effect.succeed(1),
+    RunRefused: (e) => Console.error(`outrun run: refused before anything ran:\n${e.message}`).pipe(Effect.as(2)),
+    NotRun: (e) => Console.error(`outrun: not run on the fleet: ${e.message}`).pipe(Effect.as(3)),
   }),
   Effect.catchIf(CliError.isCliError, () => Effect.succeed(2)),
   Effect.provide(BunServices.layer),
