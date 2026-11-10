@@ -32,3 +32,27 @@ export const saveScans = (dir: string, scans: Scans) =>
     },
     catch: () => new FileFailed({ message: `${dir}/${SCANS}: not writable` }),
   });
+
+const CELLS = "run-cells.json";
+
+/** `outrun run`: the cells each workflow's job ran last time on this machine, by "<repo> <workflow> <job>". */
+export type Cells = Record<string, number>;
+
+export const loadCells = (dir: string) =>
+  Effect.tryPromise({
+    try: async () => {
+      const file = Bun.file(`${dir}/${CELLS}`);
+      return (await file.exists()) ? ((await file.json()) as Cells) : {};
+    },
+    catch: () => new FileFailed({ message: `${dir}/${CELLS}: unreadable` }),
+  });
+
+export const saveCells = (dir: string, cells: Cells) =>
+  Effect.tryPromise({
+    try: async () => {
+      await mkdir(dir, { recursive: true });
+      await Bun.write(`${dir}/${CELLS}.tmp`, JSON.stringify(cells));
+      await rename(`${dir}/${CELLS}.tmp`, `${dir}/${CELLS}`);
+    },
+    catch: () => new FileFailed({ message: `${dir}/${CELLS}: not writable` }),
+  });

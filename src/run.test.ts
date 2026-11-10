@@ -7,11 +7,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Layer from "effect/Layer";
 import { afterAll, describe, expect, it } from "vitest";
-import { NotRun } from "./check.ts";
+import { CheckApi, type CheckEvent, NotRun } from "./check.ts";
 import { condition, evaluate, interpolate, parse } from "./expr.ts";
 import { basePrelude } from "./job-script.ts";
-import { type Cell, prepare, type Ran, runWorkflow } from "./run.ts";
+import { type Cell, fleet, prepare, type Ran, runWorkflow } from "./run.ts";
 import { expandMatrix, parseWorkflow } from "./workflow.ts";
 
 const dirs: string[] = [];
@@ -407,4 +408,122 @@ describe("the run's checkout on a VM", () => {
     }
     // About 25 git processes: past vitest's 5 s when the whole suite loads the machine.
   }, 30_000);
+});
+
+// The fleet behind `outrun run` (run.ts `fleet`), on a fake control plane: each check one VM, its
+// apply at once, its shard answered with the job's report.
+// `slow`: a check whose VM comes up late.
+const fakeFleet = (slow?: string) => {
+  const calls: string[] = [];
+  const events = new Map<string, CheckEvent[]>();
+  let next = 0;
+  const push = (id: string, event: Omit<CheckEvent, "seq" | "ms" | "log" | "worker">) => {
+    const list = events.get(id) ?? [];
+    list.push({ ms: 1, log: "", worker: `w-${id}`, ...event, seq: list.length + 1 });
+    events.set(id, list);
+  };
+  const layer = Layer.succeed(CheckApi, {
+    create: () =>
+      Effect.sync(() => {
+        const id = `c${++next}`;
+        calls.push(`create ${id}`);
+        push(id, { step: "up", code: 0, json: {} });
+        return { id, sha: "a".repeat(40), workers: [{ name: `w-${id}`, mini: "mm1" }] };
+      }),
+    patch: (id) =>
+      Effect.sleep(id === slow ? "40 millis" : "1 millis").pipe(Effect.andThen(Effect.sync(() => void push(id, { step: "apply", code: 0, json: {} })))),
+    // A job's program takes a moment, as on a VM.
+    shards: (id, shards) =>
+      Effect.sync(() => {
+        const name = shards[0]!.tasks[0]!;
+        calls.push(`run ${name} on ${id}`);
+        return name;
+      }).pipe(
+        Effect.tap((name) =>
+          Effect.sleep("20 millis").pipe(
+            Effect.andThen(
+              Effect.sync(() => push(id, { step: "shard", code: 0, json: { job: { outputs: name.endsWith(":plan") ? { shards: "[1,2]" } : {}, steps: [] } } })),
+            ),
+          ),
+        ),
+        Effect.asVoid,
+      ),
+    events: (id, after) =>
+      Effect.suspend(() => {
+        const later = (events.get(id) ?? []).filter((e) => e.seq > after);
+        return later.length > 0 ? Effect.succeed(later) : Effect.never;
+      }),
+    end: (id) => Effect.sync(() => void calls.push(`end ${id}`)),
+  });
+  return { calls, layer };
+};
+
+describe("VMs started ahead while a job's needs run", () => {
+  const yaml = `on: workflow_dispatch
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: \${{ steps.list.outputs.shards }}
+    steps:
+      - id: list
+        run: echo 'shards=[1,2]' >> "$GITHUB_OUTPUT"
+  test:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: \${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - run: echo "shard \${{ matrix.shard }}"
+`;
+  const runOn = (cells: Record<string, number>, slow?: string) => {
+    const { calls, layer } = fakeFleet(slow);
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        const { workflow, jobs, inputs } = yield* prepare("w.yml", yaml, [], [], "acme/app");
+        const f = yield* fleet(
+          "acme/app",
+          () => Effect.succeed("patch"),
+          () => Effect.succeed("m"),
+          undefined,
+          undefined,
+          cells,
+        );
+        const results = yield* runWorkflow(workflow, jobs, { repository: "acme/app", ref: "refs/heads/main", inputs }, f.runCell, () => Effect.void, f.ahead);
+        const learned = yield* f.close;
+        return { results: Object.fromEntries(results), learned, calls };
+      }).pipe(Effect.provide(layer)),
+    );
+  };
+
+  it("starts as many VMs for a job as it ran cells last time, runs its cells on them, and ends the ones left", async () => {
+    const { results, learned, calls } = await runOn({ test: 3 });
+    expect(results).toEqual({ plan: "success", test: "success" });
+    // The plan's VM and the 3 started ahead are created before the plan's program runs.
+    expect(calls.indexOf("create c4")).toBeLessThan(calls.indexOf("run w.yml:test (1) on c2"));
+    expect(calls.indexOf("create c4")).toBeGreaterThan(-1);
+    expect(calls.filter((c) => c.startsWith("create"))).toHaveLength(4);
+    const shards = calls.filter((c) => c.startsWith("run w.yml:test"));
+    expect(shards.map((c) => c.split(" on ")[1]).sort()).toEqual(["c2", "c3"]);
+    // Every VM ended, the one nobody used too; the counts learned for the next run.
+    expect(calls.filter((c) => c.startsWith("end")).sort()).toEqual(["end c1", "end c2", "end c3", "end c4"]);
+    expect(learned).toEqual({ plan: 1, test: 2 });
+  });
+
+  it("gives each cell the first VM ready, the plan included: the run's VMs are all the same", async () => {
+    const { results, calls } = await runOn({ test: 2 }, "c1");
+    expect(results).toEqual({ plan: "success", test: "success" });
+    expect(calls).toContain("run w.yml:plan on c2");
+    expect(calls.filter((c) => c.startsWith("create"))).toHaveLength(3);
+    expect(calls.filter((c) => c.startsWith("end")).sort()).toEqual(["end c1", "end c2", "end c3"]);
+  });
+
+  it("with nothing learned, starts a job's VMs once its needs ran", async () => {
+    const { results, learned, calls } = await runOn({});
+    expect(results).toEqual({ plan: "success", test: "success" });
+    expect(calls.indexOf("create c2")).toBeGreaterThan(calls.indexOf("run w.yml:plan on c1"));
+    expect(calls.filter((c) => c.startsWith("create"))).toHaveLength(3);
+    expect(learned).toEqual({ plan: 1, test: 2 });
+  });
 });

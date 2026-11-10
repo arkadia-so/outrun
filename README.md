@@ -326,11 +326,19 @@ OUTRUN_API_TOKEN=ort_... OUTRUN_INSTALLATION=<id> OUTRUN_GITHUB_TOKEN=<a token t
   the feature, the file and the line: other actions (`uses:`), `services`, `container`,
   `concurrency`, `environment`, `secrets`, `vars`, `github.token`, `hashFiles()`, checkout `ref` or
   `path`, a macOS or Windows `runs-on`.
+- A job waiting for its `needs` gets its VMs started meanwhile, as many as it ran matrix cells last
+  time (learned per repository, workflow and job in `~/.cache/outrun/run-cells.json`; nothing to
+  configure), so a planner's shards start on VMs already up with your tree.
 - Exit 0: every job passed (or was skipped by its `if:`); 1: a job failed; 2: refused; 3: outrun did
   not run it (unreachable, no warm checkout yet, no VM free, a worker lost): run it locally instead.
   The repository must be listed in the installation's check settings.
 
 ## outrun check: the fast CI on outrun's VMs
+
+Leaving: `outrun run <workflow>` ("outrun run") replaces it, with an ordinary workflow instead of
+`.outrun/check.json`'s `plan` and `run`. `outrun check` and `--workers` go on 2026-11-18; the file's
+`setup`, `prefill` and `install`, which prepare the warm checkouts `outrun run` uses too, stay until
+a warm is set up from the workflows' own steps (by 2026-11-25).
 
 `outrun check` runs a repository's fast CI on the tree of HEAD (committed changes only) on outrun's
 Linux VMs instead of the laptop: warm checkouts of `main`, HEAD's tree sent as a patch, the units

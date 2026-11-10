@@ -22,13 +22,17 @@ import * as Flag from "effect/cli/Flag";
 import * as Console from "effect/Console";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import * as Scoped from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import { CheckApi, checkApiLive, NotRun, Repo, repoLive, treeOf, waitFor } from "./check.ts";
 import { condition, evaluate, interpolate, type Scope, truthy, type Value } from "./expr.ts";
 import { basePrelude, compileJob } from "./job-script.ts";
+import { type Cells, loadCells, saveCells, stateDir } from "./state.ts";
 import {
   cellName,
   type Combination,
@@ -78,6 +82,15 @@ export interface Cell {
   readonly timeoutMs: number;
 }
 export type RunCell<R = never> = (cell: Cell) => Effect.Effect<Ran, NotRun, R>;
+/**
+ * VMs started ahead: `start` when a job begins waiting for its needs (the job's cells may get VMs
+ * restored and patched meanwhile, the tree being known), `settle` once its cells ran (`cells` of
+ * them; 0 when it was skipped). Neither changes what runs: only when its VMs are ready.
+ */
+export interface Ahead<R = never> {
+  readonly start: (job: string) => Effect.Effect<void, never, R>;
+  readonly settle: (job: string, cells: number) => Effect.Effect<void, never, R>;
+}
 
 const refusalText = (path: string, refusals: readonly Refusal[]) => [...new Set(refusals.map((r) => `${path}:${r.line}: ${r.what}`))].join("\n");
 
@@ -133,7 +146,14 @@ const resolveValue = (value: unknown, scope: Scope): Value => {
  * each cell's line (and a failed one's log) through `print`. Fails RunRefused when a job's runs-on or
  * matrix, known only once its needs ran, is outside v1; NotRun when the fleet did not run a cell.
  */
-export const runWorkflow = <R>(workflow: Workflow, jobs: readonly Job[], context: Context, runCell: RunCell<R>, print: (line: string) => Effect.Effect<void>) =>
+export const runWorkflow = <R>(
+  workflow: Workflow,
+  jobs: readonly Job[],
+  context: Context,
+  runCell: RunCell<R>,
+  print: (line: string) => Effect.Effect<void>,
+  ahead?: Ahead<R>,
+) =>
   Effect.gen(function* () {
     const done = new Map(
       yield* Effect.forEach(jobs, (job) => Deferred.make<{ result: Result; outputs: Record<string, string> }>().pipe(Effect.map((d) => [job.id, d] as const))),
@@ -143,6 +163,7 @@ export const runWorkflow = <R>(workflow: Workflow, jobs: readonly Job[], context
     const runJob = (job: Job) =>
       Effect.gen(function* () {
         const needs: Record<string, { result: Result; outputs: Record<string, string> }> = {};
+        if (ahead && job.needs.length > 0) yield* ahead.start(job.id);
         for (const need of job.needs) needs[need] = yield* Deferred.await(done.get(need)!);
         const github = githubOf(workflow, job, context);
         const base: Scope = {
@@ -156,7 +177,7 @@ export const runWorkflow = <R>(workflow: Workflow, jobs: readonly Job[], context
         const refuse = (what: string) => new RunRefused({ message: refusalText(workflow.path, [{ line: job.line, what: `job ${job.id}: ${what}` }]) });
         if (!truthy(evaluate(condition(job.raw.if as string | undefined), base))) {
           yield* print(`- ${job.id}: skipped`);
-          return { result: "skipped" as const, outputs: {} };
+          return { result: "skipped" as const, outputs: {}, cells: 0 };
         }
         const strategy = (job.raw.strategy ?? {}) as Record<string, unknown>;
         let combos: (Combination | null)[] = [null];
@@ -208,29 +229,59 @@ export const runWorkflow = <R>(workflow: Workflow, jobs: readonly Job[], context
         );
         // A matrix job's outputs: each cell's, the last one's winning, as GitHub's.
         const outputs = Object.assign({}, ...ran.map((r) => r.outputs)) as Record<string, string>;
-        return { result: ran.some((r) => r.result === "failure") ? ("failure" as const) : ("success" as const), outputs };
+        return { result: ran.some((r) => r.result === "failure") ? ("failure" as const) : ("success" as const), outputs, cells: combos.length };
       }).pipe(
+        Effect.tap((outcome) => (ahead ? ahead.settle(job.id, outcome.cells) : Effect.void)),
         Effect.tap((outcome) => Effect.sync(() => results.set(job.id, outcome.result))),
-        Effect.tap((outcome) => Deferred.succeed(done.get(job.id)!, outcome)),
+        Effect.tap((outcome) => Deferred.succeed(done.get(job.id)!, { result: outcome.result, outputs: outcome.outputs })),
       );
     yield* Effect.forEach(jobs, runJob, { concurrency: "unbounded", discard: true });
     return results;
   });
 
-// A cell on the fleet: one check of one worker (outrun check's create, patch, shard), its script as
-// the shard; `patchOf` HEAD's tree on a warm commit, once per commit for the whole run.
-const fleetCell =
-  (
-    repo: string,
-    patchOf: (sha: string) => Effect.Effect<string, NotRun>,
-    message: (sha: string) => Effect.Effect<string, NotRun>,
-    base: { sha: string; change: string } | undefined,
-    // The base's commit object, which the cell's checkout gets back (job-script.ts basePrelude).
-    baseCommit: string | undefined,
-  ): RunCell<CheckApi> =>
-  (cell) =>
-    Effect.gen(function* () {
-      const api = yield* CheckApi;
+// A VM started ahead is given to a cell only while it has been ready for less than this: the control
+// plane ends a check idle for CHECK_IDLE_MS (120 s, control-plane checks.ts).
+const AHEAD_FRESH_MS = 60_000;
+
+// A VM of the run, restored and patched with the tree, waiting for its cell's program.
+interface Ready {
+  readonly id: string;
+  readonly mini: string;
+  readonly sha: string;
+  readonly after: number;
+  readonly at: number;
+}
+
+/**
+ * The cells on the fleet: each one check of one worker (outrun check's create, patch, shard), its
+ * program as the shard; `patchOf` HEAD's tree on a warm commit, once per commit for the whole run.
+ * Every VM of a run is the same (the repository's warm, patched with the tree), so the VMs form one
+ * pool and a cell takes the first ready. A job waiting for its needs adds to it as many VMs as it ran
+ * cells last time (`cells`, by job id), so its cells start on VMs already up and patched and its needs
+ * on the first ready; `close` ends what the run did not use.
+ */
+export const fleet = (
+  repo: string,
+  patchOf: (sha: string) => Effect.Effect<string, NotRun>,
+  message: (sha: string) => Effect.Effect<string, NotRun>,
+  base: { sha: string; change: string } | undefined,
+  // The base's commit object, which the cell's checkout gets back (job-script.ts basePrelude).
+  baseCommit: string | undefined,
+  cells: Record<string, number>,
+) =>
+  Effect.gen(function* () {
+    const api = yield* CheckApi;
+    // VMs ready and not given to a cell yet, by check id.
+    const idle = new Set<string>();
+    // The VMs coming (starting or ready in `pool`) that no cell has claimed yet.
+    let coming = 0;
+    const pool = yield* Queue.unbounded<Exit.Exit<Ready, NotRun>>();
+    // The VMs' starts belong to the run, not to the cell or job that asked for them.
+    const starts = yield* Scoped.make();
+    const learned: Record<string, number> = {};
+
+    // A VM up and patched, or NotRun; a check created and then failed or interrupted is ended.
+    const acquire = Effect.gen(function* () {
       const t0 = Date.now();
       // No VM free now: the run's other cells hold some, so this one waits its turn, within READY_MS.
       const check = yield* api
@@ -238,36 +289,84 @@ const fleetCell =
         .pipe(Effect.retry({ schedule: Schedule.spaced("3 seconds"), while: (e) => / 409 full\b/.test(e.message) && Date.now() - t0 < READY_MS }));
       return yield* Effect.gen(function* () {
         const worker = check.workers[0];
-        if (!worker) return yield* new NotRun({ message: `${cell.name}: the fleet gave no VM` });
+        if (!worker) return yield* new NotRun({ message: "the fleet gave no VM" });
         const sha = worker.sha ?? check.sha;
         yield* api.patch(check.id, check.sha, { [sha]: yield* patchOf(sha) }, yield* message(base?.sha ?? sha), base?.change);
         const ready = yield* waitFor(check.id, 0, (events) => events.some((e) => e.step === "apply"), t0 + READY_MS, t0);
         const broken = ready.events.find((e) => e.code !== 0);
-        if (broken) return yield* new NotRun({ message: `${cell.name}: ${broken.worker} ${broken.step}: exit ${broken.code}: ${broken.log.slice(-500)}` });
-        yield* api.shards(check.id, [
-          {
-            worker: 0,
-            tasks: [cell.id],
-            script: base && baseCommit ? basePrelude(base.sha, baseCommit) + cell.script : cell.script,
-            timeoutMs: cell.timeoutMs,
-          },
-        ]);
-        const sent = Date.now();
-        const ran = yield* waitFor(check.id, ready.after, (events) => events.some((e) => e.step === "shard"), sent + cell.timeoutMs + RESULT_SLACK_MS, sent);
-        const shard = ran.events.find((e) => e.step === "shard")!;
-        const job = (shard.json.job ?? null) as { outputs?: Record<string, unknown>; steps?: StepLine[] } | null;
-        // A shard that ran no job script (an agent before `outrun run`) is not a verdict.
-        if (!job && shard.code === 0) return yield* new NotRun({ message: `${cell.name}: ${worker.mini}'s agent reported no job: it predates outrun run` });
-        return {
-          result: shard.code === 0 ? ("success" as const) : ("failure" as const),
-          outputs: Object.fromEntries(Object.entries(job?.outputs ?? {}).map(([k, v]) => [k, String(v)])),
-          steps: Array.isArray(job?.steps) ? job.steps : [],
-          log: shard.log,
-          ms: Date.now() - t0,
-          where: `${worker.mini}, main at ${sha.slice(0, 8)}`,
-        };
-      }).pipe(Effect.ensuring(api.end(check.id)));
+        if (broken) return yield* new NotRun({ message: `${broken.worker} ${broken.step}: exit ${broken.code}: ${broken.log.slice(-500)}` });
+        idle.add(check.id);
+        return { id: check.id, mini: worker.mini, sha, after: ready.after, at: Date.now() } satisfies Ready;
+      }).pipe(Effect.onError(() => api.end(check.id)));
     });
+
+    const start = Effect.gen(function* () {
+      coming++;
+      yield* Effect.forkIn(
+        acquire.pipe(
+          Effect.exit,
+          Effect.flatMap((exit) => Queue.offer(pool, exit)),
+        ),
+        starts,
+      );
+    });
+
+    const ahead: Ahead<CheckApi> = {
+      start: (job) => Effect.forEach(Array.from({ length: Math.min(cells[job] ?? 0, MAX_CELLS) }), () => start, { discard: true }),
+      settle: (job, ran) => Effect.sync(() => void (ran > 0 && (learned[job] = ran))),
+    };
+
+    // The first VM ready, one started for it when none is coming unclaimed. One older than
+    // AHEAD_FRESH_MS is ended and the next taken; one that failed to start, another started for it.
+    const vm: Effect.Effect<Ready, NotRun, CheckApi> = Effect.gen(function* () {
+      if (coming === 0) yield* start;
+      coming--;
+      const exit = yield* Queue.take(pool);
+      if (Exit.isFailure(exit)) return yield* acquire.pipe(Effect.tap((ready) => Effect.sync(() => idle.delete(ready.id))));
+      idle.delete(exit.value.id);
+      if (Date.now() - exit.value.at < AHEAD_FRESH_MS) return exit.value;
+      yield* api.end(exit.value.id);
+      return yield* vm;
+    });
+
+    const runCell: RunCell<CheckApi> = (cell) =>
+      Effect.gen(function* () {
+        const t0 = Date.now();
+        const got = yield* vm.pipe(Effect.mapError((e) => new NotRun({ message: `${cell.name}: ${e.message}` })));
+        return yield* Effect.gen(function* () {
+          yield* api.shards(got.id, [
+            {
+              worker: 0,
+              tasks: [cell.id],
+              script: base && baseCommit ? basePrelude(base.sha, baseCommit) + cell.script : cell.script,
+              timeoutMs: cell.timeoutMs,
+            },
+          ]);
+          const sent = Date.now();
+          const ran = yield* waitFor(got.id, got.after, (events) => events.some((e) => e.step === "shard"), sent + cell.timeoutMs + RESULT_SLACK_MS, sent);
+          const shard = ran.events.find((e) => e.step === "shard")!;
+          const job = (shard.json.job ?? null) as { outputs?: Record<string, unknown>; steps?: StepLine[] } | null;
+          // A shard that ran no job script (an agent before `outrun run`) is not a verdict.
+          if (!job && shard.code === 0) return yield* new NotRun({ message: `${cell.name}: ${got.mini}'s agent reported no job: it predates outrun run` });
+          return {
+            result: shard.code === 0 ? ("success" as const) : ("failure" as const),
+            outputs: Object.fromEntries(Object.entries(job?.outputs ?? {}).map(([k, v]) => [k, String(v)])),
+            steps: Array.isArray(job?.steps) ? job.steps : [],
+            log: shard.log,
+            ms: Date.now() - t0,
+            where: `${got.mini}, main at ${got.sha.slice(0, 8)}`,
+          };
+        }).pipe(Effect.ensuring(api.end(got.id)));
+      });
+
+    // The VMs nobody used, ended; the cells' counts the jobs ran, for the next run.
+    const close = Effect.gen(function* () {
+      yield* Scoped.close(starts, Exit.void);
+      yield* Effect.forEach([...idle], (id) => Effect.sync(() => idle.delete(id)).pipe(Effect.andThen(api.end(id))), { discard: true });
+      return learned;
+    });
+    return { runCell, ahead, close };
+  });
 
 // The workflow file: a path, or a name in the repository's .github/workflows.
 const locate = (name: string) => {
@@ -353,12 +452,26 @@ const handler = ({
       const base = yield* repo.base;
       const baseCommit = base ? spawnSync("git", ["cat-file", "commit", base.sha], { encoding: "utf8" }) : undefined;
       yield* Console.log(`outrun run: ${found.shown}: ${jobs.length} job(s) on ${repository}, the tree ${ref ? `of ${ref}` : "of HEAD with its changes"}`);
-      const results = yield* runWorkflow(
-        workflow,
-        jobs,
-        { repository, ref: branch, inputs },
-        fleetCell(repository, patchOf, repo.messageFrom, base, baseCommit?.status === 0 ? baseCommit.stdout : undefined),
-        (line) => Console.log(line),
+      // The cells each job ran last time here: as many VMs start ahead while its needs run.
+      const dir = stateDir(process.env);
+      const key = (job: string) => `${repository} ${found.shown} ${job}`;
+      // A cache: unreadable, nothing starts ahead.
+      const known = yield* loadCells(dir).pipe(Effect.catchTag("FileFailed", () => Effect.succeed<Cells>({})));
+      const cells = Object.fromEntries(jobs.flatMap((j) => (known[key(j.id)] ? [[j.id, known[key(j.id)]!]] : [])));
+      const cellsOf = yield* fleet(repository, patchOf, repo.messageFrom, base, baseCommit?.status === 0 ? baseCommit.stdout : undefined, cells);
+      const results = yield* runWorkflow(workflow, jobs, { repository, ref: branch, inputs }, cellsOf.runCell, (line) => Console.log(line), cellsOf.ahead).pipe(
+        Effect.ensuring(
+          cellsOf.close.pipe(
+            Effect.flatMap((learned) =>
+              Object.keys(learned).length === 0
+                ? Effect.void
+                : // A cache: not writable, the next run starts nothing ahead.
+                  saveCells(dir, { ...known, ...Object.fromEntries(Object.entries(learned).map(([j, n]) => [key(j), n])) }).pipe(
+                    Effect.catchTag("FileFailed", () => Effect.void),
+                  ),
+            ),
+          ),
+        ),
       );
       const failed = [...results].filter(([, r]) => r === "failure").map(([j]) => j);
       if (failed.length > 0) {

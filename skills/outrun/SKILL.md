@@ -4,7 +4,7 @@ description: >-
   Move a repository's GitHub Actions CI to outrun (outrun.sh) and make it as fast as it can be:
   the one-line move to outrun's runners, the measurement protocol (pickup, checkout, setup, work,
   cache saves; cold, warm, one-file and wide changes), the levers ranked by measured gain (warm
-  runners, split and time-balanced test jobs, affected-only tests on push, `outrun check` for the
+  runners, split and time-balanced test jobs, affected-only tests on push, `outrun run` for the
   pre-push gate, caches kept on the machines, the image's tools, e2e sharding and replay), the traps
   already hit with their fixes, what the repository's owner decides versus what an agent may change
   (with each change's rollback), and when the work is done. Use when a repository moves to outrun,
@@ -18,7 +18,7 @@ This is the playbook for an agent, working for a repository's owner, that moves 
 outrun and then makes it as fast as possible. Every figure comes from a real customer's CI, measured
 before and after the change. Most of them come from **a Flutter + TypeScript monorepo** with Linux,
 Android, iOS and simulator end-to-end jobs. Reference: [README.md](../../README.md) (the CLI, the
-action, `outrun check`, `outrun e2e`), and [outrun.sh](https://outrun.sh).
+action, `outrun run`, `outrun e2e`), and [outrun.sh](https://outrun.sh).
 
 Three rules hold throughout:
 
@@ -51,7 +51,7 @@ does. It is not there yet.
    `permissions: id-token: write` and `OUTRUN_CACHE_URL: https://cache.outrun.sh`. Without the URL,
    verdicts stay on one machine. The e2e reusable workflow sets the URL itself, but still needs
    `id-token: write`.
-2. **Units**: `outrun.json` (suites, commands) and `.outrun/check.json` for `outrun check`. Only
+2. **Units**: `outrun.json` (suites, commands). Only
    TesterArmy e2e suites are found with no file (`--e2e`). Nx and Bazel keep their own task graph,
    and you start `outrun nx-cache` or `outrun bazel-cache` and point the tool at it.
 3. **Large caches on macOS runners**: `actions/cache` there is outrun's cache, but a folder
@@ -144,24 +144,24 @@ monorepo unless stated otherwise.
      text: in the monorepo, 43 of the 129 tests one leaf file selected were of that kind.
    - Keep the full suite on the default branch and at night, so a wrong selection is caught within
      the day.
-5. **The pre-push gate on outrun: `outrun check`.** The repository's fast check runs on warm
-   checkouts of the default branch, split over several VMs by the units' measured times (README,
-   "outrun check").
+5. **The pre-push gate on outrun: `outrun run presubmit.yml`.** The gate is an ordinary workflow
+   (a `presubmit.yml` with only `workflow_dispatch`), run by the pre-push hook on the tree being
+   pushed, on warm checkouts of the default branch (README, "outrun run"): nothing outrun-specific to
+   write, and the same file runs on GitHub. Write its jobs with `run:` steps and `actions/checkout`
+   only (other actions are refused, exit 2), and split it with a planning job whose output feeds a
+   `fromJSON` matrix, each cell a share of the units balanced by their expected times. On exit 3 the
+   hook runs the checks locally.
 
    | Change | Before | After |
    | -- | -- | -- |
-   | One Dart file | 108–113 s on a laptop; 31.7–34.7 s on an older `outrun check` | **16.3–18.9 s** |
-   | Docs only | 4.9 s | **4.1–4.3 s** |
-   | Wide (447 units) | 128 s | **52 s** |
+   | One Dart file | 108–113 s on a laptop | **17.3–19.5 s** |
+   | One backend file | — | **16.0–19.0 s** |
+   | One TypeScript file (turbo monorepo) | 15.2–20.7 s through the older `outrun check` | **12.8–22.6 s, median ~16.5 s** |
 
-   The floor is then the slowest single unit: two of 13–17 s each in this case. `outrun check` names
-   every unit alone over `--target`: split it or cache its output.
-
-   Since 1.9 the gate can be an ordinary workflow instead (a `presubmit.yml` with only
-   `workflow_dispatch`), run by the hook with `outrun run presubmit.yml` on the tree being pushed
-   (README, "outrun run"): nothing outrun-specific to write, and the same file runs on GitHub. Write
-   its jobs with `run:` steps and `actions/checkout` only (other actions are refused, exit 2), and
-   split it with a planning job whose output feeds a `fromJSON` matrix.
+   outrun starts the matrix's VMs while the planning job runs, as many as past runs had (nothing to
+   configure), so a shard starts 2–3 s after the plan. The floor is then the slowest shard's own
+   work: split its slowest unit or cache its output. `outrun check` (`.outrun/check.json`) is the
+   older gate and leaves outrun by 2026-11-18: do not start a repository on it.
 6. **Large caches on the machine, not over the network.**
    - A signed iOS build restored 8 GB of Swift packages over the network. Its first runs on fresh
      machines took **505–1670 s** (the restore alone up to 1043 s).
@@ -210,8 +210,8 @@ monorepo unless stated otherwise.
 | arm64 gaps | `flutter` has no Linux arm64 archive. Android's build tools fail on arm64. `gh`, `zip`, `sqlite3`, `pip` or `aws` are missing. | Upstream ships x64 only, or the image lacks the tool. | Install Flutter from its git tag and run `precache`. Keep Android jobs on an x64 label. Install a missing tool only when `command -v` fails. |
 | Out of memory | A test job is SIGKILLed (exit 137) only on some runs. | The job's peak memory (one suite: 4.9 GB, one file 2.1 GB) exceeded a smaller VM. | Measure the peak RSS. Ask for a larger runner, or split the job. |
 | A file outside the checkout | A test passes on a laptop and fails in CI after a sparse or per-folder checkout. | The test reads another package's file. | Add the path to the job's checkout and its selection inputs. |
-| Commit messages lost in `outrun check` | A plan that reads `git log "$OUTRUN_CHECK_BASE..HEAD"` (trailers, `[skip …]` flags) sees one commit named "outrun check". | Before outrun 1.5.3, the VM committed the patch with its own message. | Use `arkadia-so/outrun@v1`, or pin 1.5.3 or later. |
-| Too few workers for a wide check | A wide change plans 547 units. `outrun check --workers 4` prints `1 worker(s)`. The one shard (~500 s expected) is cut at ~240 s with `no answer in time`, three times. The push cannot land. | Fewer workers were free than asked for, and the share outran a time limit. | Any outcome other than a verdict, and any worker count below the request on a wide change, means "not run": run the check locally (exit 3 means the same). Name the units over `--target` and split them, so a wide change still fits on few workers. |
+| Commit messages lost in `outrun check` (older gate) | A plan that reads `git log "$OUTRUN_CHECK_BASE..HEAD"` (trailers, `[skip …]` flags) sees one commit named "outrun check". | Before outrun 1.5.3, the VM committed the patch with its own message. | Use `arkadia-so/outrun@v1`, or pin 1.5.3 or later. |
+| Too few workers for a wide check (`outrun check`, older gate) | A wide change plans 547 units. `outrun check --workers 4` prints `1 worker(s)`. The one shard (~500 s expected) is cut at ~240 s with `no answer in time`, three times. The push cannot land. | Fewer workers were free than asked for, and the share outran a time limit. | Any outcome other than a verdict, and any worker count below the request on a wide change, means "not run": run the check locally (exit 3 means the same). Name the units over `--target` and split them, so a wide change still fits on few workers. |
 | Slow pickup with idle capacity | "Set up runner" takes 46–126 s, or a job queues for minutes while others start at once. | On outrun's side, the scheduler was slow to hand out jobs. | Report the run id with each job's `created_at` and `started_at`. Do not work around it in the workflow. |
 | A slow video stop blamed on the codec | An iOS e2e test's video takes tens of seconds to stop on a macOS VM, and the recording's HEVC encoding is suspected. | Not the codec: a macOS VM on Apple silicon exposes paravirtualized hardware H.264 and HEVC encoders (VideoToolbox lists them), and `simctl io recordVideo` stops in 0.1–0.8 s with HEVC (0.4–1.2 s with H.264) after up to 240 s of recording, all CPUs busy. H.264 files are twice the size. | Keep HEVC (the default). Time the harness's own stop path (its recorder's request, the file checks after it) instead. |
 | Screenshots sent as text to the e2e model | Model calls of hundreds of thousands of tokens, 429s, context overflows, wrong answers about the screen. | An OpenAI-compatible provider writes an image in a tool result as JSON text, unless told otherwise. | Create the provider with `supportsMultiPartToolContent: true`, and honour `Retry-After` on 429 and 503. |
@@ -240,7 +240,7 @@ monorepo unless stated otherwise.
 - **Settings on outrun's side:**
   - warm runners, and how many (they are machines waiting for the repository);
   - larger runners;
-  - the repository's listing for `outrun check`.
+  - the repository's listing for checks (`outrun run` on its warm checkouts).
   Ask outrun to set them, and to unset them for the rollback.
 - **Secrets, tokens, GitHub environments, OIDC trust**, and anything that publishes or deploys.
 - Moving a job **off GitHub** when a GitHub-only feature needs it (section 1).
