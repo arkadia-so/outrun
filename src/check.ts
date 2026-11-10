@@ -332,18 +332,21 @@ export const repoLive = (head = "HEAD") =>
         Effect.andThen(exec("git", ["diff", "--binary", "--no-color", "--no-ext-diff", sha, head])),
       ),
     // After patchFrom, which fetched `sha` when this clone lacked it. The commits' messages: HEAD's
-    // when the tree is HEAD's with uncommitted changes.
-    messageFrom: (sha) => {
-      const tip = /^[0-9a-f]{40}$/.test(head) ? head : "HEAD";
-      return Effect.all([
-        exec("git", ["log", "--no-merges", "--format=%B", `${sha}..${tip}`]).pipe(
-          Effect.catchTag("NotRun", () => exec("git", ["log", "--no-merges", "--format=%B", `${sha}..HEAD`])),
+    // when the tree is HEAD's with uncommitted changes. `head` is then a tree (treeOf), and `git log
+    // <sha>..<tree>` answers nothing with exit 0 (outrun run up to 1.9.2 sent no message, so a cell's
+    // `git log` found none of the push's trailers, OUT-56): only a commit stands for the tip.
+    messageFrom: (sha) =>
+      exec("git", ["cat-file", "-t", head]).pipe(
+        Effect.map((type) => (type.trim() === "commit" ? head : "HEAD")),
+        Effect.catchTag("NotRun", () => Effect.succeed("HEAD")),
+        Effect.flatMap((tip) =>
+          Effect.all([
+            exec("git", ["log", "--no-merges", "--format=%B", `${sha}..${tip}`]),
+            exec("git", ["log", "--no-merges", "--format=%(trailers:only,unfold)", `${sha}..${tip}`]),
+          ]),
         ),
-        exec("git", ["log", "--no-merges", "--format=%(trailers:only,unfold)", `${sha}..${tip}`]).pipe(
-          Effect.catchTag("NotRun", () => exec("git", ["log", "--no-merges", "--format=%(trailers:only,unfold)", `${sha}..HEAD`])),
-        ),
-      ]).pipe(Effect.map(([bodies, trailers]) => changeMessage(bodies, trailers)));
-    },
+        Effect.map(([bodies, trailers]) => changeMessage(bodies, trailers)),
+      ),
     base: Effect.gen(function* () {
       for (const ref of ["origin/HEAD", "origin/main", "origin/master"]) {
         const sha = yield* exec("git", ["merge-base", "HEAD", ref]).pipe(Effect.catchTag("NotRun", () => Effect.succeed("")));
