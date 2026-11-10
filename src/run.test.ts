@@ -337,6 +337,21 @@ jobs:
     const { results } = await run(yaml, { jobs: ["b"] });
     expect(results).toEqual({ a: "success", b: "success" });
   });
+  it("gives a job over outrun's cap, GitHub's default 360 included, the cap, and says so in one line (OUT-56: a 400)", async () => {
+    const yaml = `on: workflow_dispatch
+jobs:
+  plain: { runs-on: ubuntu-latest, strategy: { matrix: { n: [1, 2] } }, steps: [{ run: "true" }] }
+  long: { runs-on: ubuntu-latest, timeout-minutes: 90, steps: [{ run: "true" }] }
+  short: { runs-on: ubuntu-latest, timeout-minutes: 5, steps: [{ run: "true" }] }
+`;
+    const { results, cells, lines } = await run(yaml);
+    expect(results).toEqual({ plain: "success", long: "success", short: "success" });
+    expect(Object.fromEntries(cells.map((c) => [c.name, c.timeoutMs / 60_000]))).toEqual({ "plain (1)": 15, "plain (2)": 15, long: 15, short: 5 });
+    expect(lines.filter((l) => l.includes("cap"))).toEqual([
+      "- plain: timeout-minutes 360 (GitHub's default) is over outrun's cap: 15 min",
+      "- long: timeout-minutes 90 is over outrun's cap: 15 min",
+    ]);
+  });
   it("is not run (NotRun) when the fleet does not run a cell", async () => {
     const parsed = parseWorkflow(
       "w.yml",

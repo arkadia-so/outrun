@@ -1,14 +1,13 @@
-import { mkdtemp } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
 import type { Suite } from "../config.ts";
+import { tempDir } from "../test-tmp.ts";
 import { bunAdapter } from "./bun.ts";
 
 const suite: Suite = { name: "s", adapter: "bun", dir: ".", tests: ["**/*.test.ts"], run: ["bun", "test"] };
 
 const results = async (files: string[], code: number, output: string) => {
-  const batch = bunAdapter.batch(suite, "/repo", files, await mkdtemp(`${tmpdir()}/outrun-bun-`));
+  const batch = bunAdapter.batch(suite, "/repo", files, await tempDir("outrun-bun-"));
   return Effect.runPromise(batch.results({ code, output }));
 };
 

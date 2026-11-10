@@ -1,17 +1,17 @@
 // The vitest and pytest adapters against the real runners, on two files: one passing, one failing.
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, writeFile } from "node:fs/promises";
 import { posix } from "node:path";
 import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
 import type { Suite } from "../config.ts";
+import { tempDir } from "../test-tmp.ts";
 import type { Adapter } from "./adapter.ts";
 import { catch2Adapter, testSpec } from "./catch2.ts";
 import { pytestAdapter } from "./pytest.ts";
 import { vitestAdapter } from "./vitest.ts";
 
 const runBatch = async (adapter: Adapter, suite: Suite, repo: string, files: string[]) => {
-  const scratch = await mkdtemp(`${tmpdir()}/outrun-scratch-`);
+  const scratch = await tempDir("outrun-scratch-");
   const batch = adapter.batch(suite, repo, files, scratch);
   const child = Bun.spawn([...batch.argv], { cwd: batch.cwd, stdout: "pipe", stderr: "pipe" });
   const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
@@ -19,7 +19,7 @@ const runBatch = async (adapter: Adapter, suite: Suite, repo: string, files: str
 };
 
 const project = async (files: Record<string, string>) => {
-  const repo = await mkdtemp(`${tmpdir()}/outrun-runner-`);
+  const repo = await tempDir("outrun-runner-");
   for (const [path, text] of Object.entries(files)) {
     await mkdir(posix.dirname(posix.join(repo, path)), { recursive: true });
     await writeFile(posix.join(repo, path), text);

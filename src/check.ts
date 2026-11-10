@@ -76,7 +76,9 @@ export class CheckApi extends Context.Service<
   {
     // `run`: a job of `outrun run` (run.ts): its workers on Minis whose agent runs a job's script,
     // and no worker plans.
-    readonly create: (repo: string, workers: number, run?: boolean) => Effect.Effect<Created, NotRun>;
+    // `main`: the commit of main the change is on (the push's base), so the fleet rebuilds warms
+    // behind it (outrun 1.9.4).
+    readonly create: (repo: string, workers: number, run?: boolean, main?: string) => Effect.Effect<Created, NotRun>;
     // `patches`: HEAD's tree as a patch on each warm commit the workers start from (by sha);
     // `message`: the commit messages of the change (Repo `messageFrom`), the VM's commit's;
     // `change`: the push's base to HEAD (Repo `base`), absent when the clone has no remote main.
@@ -414,11 +416,11 @@ export const checkApiLive = (api: string, installation: string, token: string, g
       ),
     );
   return Layer.succeed(CheckApi, {
-    create: (repo, workers, run) =>
+    create: (repo, workers, run, main) =>
       request("", {
         method: "POST",
         // `bases`: this CLI sends a patch for each warm commit, so workers may start from several.
-        body: { protocol: CHECK_PROTOCOL, repo, workers, bases: true, ...(run ? { run: true } : {}) },
+        body: { protocol: CHECK_PROTOCOL, repo, workers, bases: true, ...(run ? { run: true } : {}), ...(main ? { main } : {}) },
         ...(githubToken ? { headers: { "x-github-token": githubToken } } : {}),
       }).pipe(Effect.map((body) => body as unknown as Created)),
     patch: (id, sha, patches, message, change) =>

@@ -1,6 +1,6 @@
 {
   "name": "@arkadia-so/outrun",
-  "version": "1.9.3",
+  "version": "1.9.4",
   "private": true,
   "description": "outrun's CI engine: each test file a unit, keyed by its content, its verdict cached, the misses batched and balanced across runners.",
   "homepage": "https://outrun.sh",

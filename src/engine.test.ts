@@ -1,10 +1,10 @@
 // End to end: a git repository with a bun workspace, run, re-run, changed, failed.
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, rm, writeFile } from "node:fs/promises";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Exit } from "effect";
 import { blocking, contextDiff, deadlineMs, lookupCommand, plan, recordCommand, test as outrunTest, type TestOptions } from "./engine.ts";
 import { FileFailed } from "./errors.ts";
+import { tempDir } from "./test-tmp.ts";
 
 const io = <A>(f: () => Promise<A>) => Effect.tryPromise({ try: f, catch: (e) => new FileFailed({ message: String(e) }) });
 
@@ -25,7 +25,7 @@ const git = (dir: string, ...args: string[]) => {
 
 const setup = (extra: Record<string, string> = {}) =>
   io(async () => {
-    const dir = await mkdtemp(`${tmpdir()}/outrun-e2e-`);
+    const dir = await tempDir("outrun-e2e-");
     await write(dir, {
       ...extra,
       "package.json": JSON.stringify({ name: "acme", private: true }),
@@ -43,7 +43,7 @@ const setup = (extra: Record<string, string> = {}) =>
     git(dir, "init", "-q");
     git(dir, "add", ".");
     git(dir, "commit", "-qm", "init");
-    const state = await mkdtemp(`${tmpdir()}/outrun-state-`);
+    const state = await tempDir("outrun-state-");
     return { dir, state };
   });
 
@@ -98,7 +98,7 @@ describe("outrun test", () => {
     "reruns a red unit alone: green alone is flaky, quarantined and not blocking",
     () =>
       Effect.gen(function* () {
-        const marker = `${tmpdir()}/outrun-flaky-${crypto.randomUUID()}`;
+        const marker = `${yield* io(() => tempDir("outrun-flaky-"))}/marker`;
         const { dir, state } = yield* setup({
           "test/flaky.test.ts": `import { expect, test } from "bun:test"\nimport { existsSync, writeFileSync } from "node:fs"\ntest("second time", () => { const seen = existsSync("${marker}"); writeFileSync("${marker}", "1"); expect(seen).toBe(true) })\n`,
         });
@@ -143,7 +143,7 @@ describe("outrun test", () => {
     "audits a hit: a cached pass that fails now marks its suite diverged and blocks",
     () =>
       Effect.gen(function* () {
-        const flag = `${tmpdir()}/outrun-audit-${crypto.randomUUID()}`;
+        const flag = `${yield* io(() => tempDir("outrun-audit-"))}/flag`;
         const { dir, state } = yield* setup({
           "test/clock.test.ts": `import { expect, test } from "bun:test"\nimport { existsSync } from "node:fs"\ntest("outside", () => expect(existsSync("${flag}")).toBe(false))\n`,
         });

@@ -31,7 +31,7 @@ import * as Scoped from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import { CheckApi, checkApiLive, NotRun, Repo, repoLive, treeOf, waitFor } from "./check.ts";
 import { condition, evaluate, interpolate, type Scope, truthy, type Value } from "./expr.ts";
-import { basePrelude, compileJob } from "./job-script.ts";
+import { basePrelude, compileJob, RUN_MAX_MINUTES } from "./job-script.ts";
 import { type Cells, loadCells, saveCells, stateDir } from "./state.ts";
 import {
   cellName,
@@ -210,7 +210,11 @@ export const runWorkflow = <R>(
               }
               const refused = runsOnRefusal(resolveValue(job.raw["runs-on"], scope));
               if (refused) return yield* refuse(refused);
-              const compiled = compileJob(workflow, job, scope, envOf(github));
+              const { capped, ...compiled } = compileJob(workflow, job, scope, envOf(github));
+              if (capped && index === 0)
+                yield* print(
+                  `- ${job.id}: timeout-minutes ${capped.minutes}${capped.byDefault ? " (GitHub's default)" : ""} is over outrun's cap: ${RUN_MAX_MINUTES} min`,
+                );
               const result = yield* permits.withPermits(1)(runCell({ job: job.id, name, id: `${workflow.path}:${name}`, ...compiled }));
               const continueOnError = job.raw["continue-on-error"] !== undefined && truthy(resolveValue(job.raw["continue-on-error"], scope));
               const ok = result.result === "success" || continueOnError;
@@ -285,7 +289,7 @@ export const fleet = (
       const t0 = Date.now();
       // No VM free now: the run's other cells hold some, so this one waits its turn, within READY_MS.
       const check = yield* api
-        .create(repo, 1, true)
+        .create(repo, 1, true, base?.sha)
         .pipe(Effect.retry({ schedule: Schedule.spaced("3 seconds"), while: (e) => / 409 full\b/.test(e.message) && Date.now() - t0 < READY_MS }));
       return yield* Effect.gen(function* () {
         const worker = check.workers[0];

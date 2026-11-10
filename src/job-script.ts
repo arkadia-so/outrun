@@ -131,10 +131,18 @@ fi
 `;
 };
 
+// The longest job outrun runs (control-plane checks.ts RUN_MAX_MS, which refuses more). A job asking
+// more, GitHub's default 360 included, gets this cap, as GitHub caps a job at its runner's 35 days
+// (OUT-56: a job without timeout-minutes was refused, 400).
+export const RUN_MAX_MINUTES = 15;
+
 export interface Compiled {
   readonly script: string;
-  // The job's deadline (its timeout-minutes, else GitHub's default, 360).
+  // The job's deadline: its timeout-minutes, else GitHub's default (360), at most RUN_MAX_MINUTES.
   readonly timeoutMs: number;
+  // What the job asked, in minutes, when over RUN_MAX_MINUTES (`timeoutMs` is the cap); `byDefault`:
+  // it set no timeout-minutes.
+  readonly capped?: { readonly minutes: number; readonly byDefault: boolean };
 }
 
 /**
@@ -149,7 +157,10 @@ export const compileJob = (workflow: Workflow, job: Job, scope: Scope, env: Read
   const lines: string[] = [
     "set -uo pipefail",
     HELPERS,
-    "export OUTRUN_RUN_DIR=$(mktemp -d /tmp/outrun-run.XXXXXX)",
+    // Removed when the job ends, whatever its outcome (OUT-56: never removed, 419 left on a laptop by
+    // the tests); its result is written outside it (OUTRUN_RUN_RESULT).
+    `export OUTRUN_RUN_DIR=$(mktemp -d "\${TMPDIR:-/tmp}/outrun-run.XXXXXX")`,
+    "trap 'rm -rf \"$OUTRUN_RUN_DIR\"' EXIT",
     'mkdir -p "$OUTRUN_RUN_DIR/tmp" "$OUTRUN_RUN_DIR/steps"',
     ': > "$OUTRUN_RUN_DIR/steps.tsv"',
     'export RUNNER_TEMP="$OUTRUN_RUN_DIR/tmp" GITHUB_WORKSPACE="$PWD" GITHUB_STEP_SUMMARY="$OUTRUN_RUN_DIR/summary.md"',
@@ -247,6 +258,7 @@ export const compileJob = (workflow: Workflow, job: Job, scope: Scope, env: Read
   );
   return {
     script: lines.join("\n"),
-    timeoutMs: Math.max(1, minutes) * 60_000,
+    timeoutMs: Math.min(Math.max(1, minutes), RUN_MAX_MINUTES) * 60_000,
+    ...(minutes > RUN_MAX_MINUTES ? { capped: { minutes, byDefault: timeout === undefined } } : {}),
   };
 };

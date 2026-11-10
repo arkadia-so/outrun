@@ -1,18 +1,18 @@
 import { existsSync } from "node:fs";
-import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readdir, readFile, writeFile } from "node:fs/promises";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect } from "effect";
 import { FileFailed } from "./errors.ts";
+import { tempDir } from "./test-tmp.ts";
 import { restoreEntry, saveEntry } from "./tier.ts";
 
 const io = <A>(f: () => Promise<A>) => Effect.tryPromise({ try: f, catch: (e) => new FileFailed({ message: String(e) }) });
 
 const dirs = () =>
   io(async () => {
-    const own = await mkdtemp(`${tmpdir()}/outrun-tier-own-`);
-    const trusted = await mkdtemp(`${tmpdir()}/outrun-tier-protected-`);
-    const work = await mkdtemp(`${tmpdir()}/outrun-tier-work-`);
+    const own = await tempDir("outrun-tier-own-");
+    const trusted = await tempDir("outrun-tier-protected-");
+    const work = await tempDir("outrun-tier-work-");
     return { own, trusted, work, env: { OUTRUN_CACHE: own, OUTRUN_CACHE_PROTECTED: trusted } };
   });
 

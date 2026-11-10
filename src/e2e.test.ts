@@ -2,12 +2,12 @@
 // run, replayed, and rerun when the variable naming its app changes. The CLI is a stand-in with
 // e2e's interface (`list --reporter json`, `run --reporter …,junit --output <dir> <files>`), and
 // `node` a shim onto Bun, so the test needs neither Node nor the real CLI.
-import { chmod, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, rm } from "node:fs/promises";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect } from "effect";
 import { plan, planCached, test as outrunTest, type TestOptions } from "./engine.ts";
 import { FileFailed } from "./errors.ts";
+import { tempDir } from "./test-tmp.ts";
 
 const io = <A>(f: () => Promise<A>) => Effect.tryPromise({ try: f, catch: (e) => new FileFailed({ message: String(e) }) });
 
@@ -83,8 +83,8 @@ process.exit(ran.some((t) => t.fail) ? 1 : 0);
 
 const setup = (cli = CLI, tests: Record<string, string> = {}) =>
   io(async () => {
-    const dir = await mkdtemp(`${tmpdir()}/outrun-e2e-suite-`);
-    const bin = await mkdtemp(`${tmpdir()}/outrun-e2e-bin-`);
+    const dir = await tempDir("outrun-e2e-suite-");
+    const bin = await tempDir("outrun-e2e-bin-");
     await Bun.write(`${bin}/node`, `#!/bin/sh\nexec "${process.execPath}" "$@"\n`);
     await chmod(`${bin}/node`, 0o755);
     const files: Record<string, string> = {
@@ -100,7 +100,7 @@ const setup = (cli = CLI, tests: Record<string, string> = {}) =>
     git(dir, "init", "-q");
     git(dir, "add", ".");
     git(dir, "commit", "-qm", "init");
-    const state = await mkdtemp(`${tmpdir()}/outrun-state-`);
+    const state = await tempDir("outrun-state-");
     return { dir, bin, state };
   });
 

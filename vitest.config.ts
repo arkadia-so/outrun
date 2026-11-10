@@ -1,3 +1,3 @@
 import { defineConfig } from "vitest/config";
 
-export default defineConfig({ test: { include: ["src/**/*.test.ts", "action/**/*.test.ts"] } });
+export default defineConfig({ test: { include: ["src/**/*.test.ts", "action/**/*.test.ts"], globalSetup: ["./vitest.tmp.ts"] } });
