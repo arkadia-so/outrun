@@ -5,7 +5,9 @@
 // `$GITHUB_ENV`, `$GITHUB_OUTPUT` and `$GITHUB_PATH` written by each step, each step's `if:` decided
 // from the job's status so far (its value for each status computed here), `continue-on-error`,
 // `timeout-minutes`, `defaults.run`, `shell`, `working-directory`, and the job's outputs. Its result,
-// `$OUTRUN_RUN_RESULT` (`{outputs, steps: [{name, outcome, conclusion, ms}]}`), is what the CLI reads back.
+// `$OUTRUN_RUN_RESULT` (`{outputs, steps: [{name, outcome, conclusion, ms, load?}]}`), is what the CLI
+// reads back; `load`: the VM's CPU (permille of its `cpus`, mean and peak) and memory (MB, peak and
+// total) sampled each second during the step, also printed in the job's log after the step.
 import { condition, evaluate, ExprError, type Node, type Scope, template, toText, type Value } from "./expr.ts";
 import { type Job, readsRuntime, runtimeRef, shellCommand, type Workflow } from "./workflow.ts";
 
@@ -106,9 +108,54 @@ setenv() { export "$1=$2"; }
 out() { cat "$OUTRUN_RUN_DIR/steps/$1/outputs/$2" 2>/dev/null || true; }
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 state() { cat "$OUTRUN_RUN_DIR/steps/$1/$2" 2>/dev/null || true; }
-ms() { local t; t=$(date +%s%3N); [[ "$t" != *N ]] || t=$(( $(date +%s) * 1000 )); echo "$t"; }
+ms() { local t; t=$(date +%s%3N); [[ "$t" != *N ]] || t=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000' 2>/dev/null) || t=$(( $(date +%s) * 1000 )); echo "$t"; }
+# A step's timeout-minutes, replacing the step's shell: GNU timeout's exit 124, its process group
+# killed; macOS has no timeout (a job of runs-on: outrun-macos), so perl's alarm there.
+steptimeout() {
+  local s=$1; shift
+  if command -v timeout >/dev/null 2>&1; then exec timeout --kill-after=10 "$s" "$@"; fi
+  exec perl -MPOSIX=:sys_wait_h -e 'my $s = shift; my $pid = fork() // exit 125; if (!$pid) { setpgrp(0, 0); exec @ARGV or exit 127 } $SIG{ALRM} = sub { kill "TERM", -$pid; for (1 .. 100) { exit 124 if waitpid($pid, WNOHANG) > 0; select(undef, undef, undef, 0.1) } kill "KILL", -$pid; exit 124 }; alarm $s; waitpid($pid, 0); exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' "$s" "$@"
+}
 writeout() { printf '%s' "$2" > "./$1"; }
-record() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$OUTRUN_RUN_DIR/steps.tsv"; }
+record() { printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$<5:-}" >> "$OUTRUN_RUN_DIR/steps.tsv"; }
+# The VM's load, sampled every second while the job runs, to load.tsv: the time (ms), the CPU busy
+# in permille of all the VM's cores, the memory used and the total (MB). Linux from /proc; macOS from
+# ps and vm_stat. Never fails the job: no sample, no load line.
+vmcpus() { nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 0; }
+sampler() {
+  local out=$OUTRUN_RUN_DIR/load.tsv pt=0 pi=0 u n s i w q sq st t idle mem
+  if [ -r /proc/stat ]; then
+    while :; do
+      read -r _ u n s i w q sq st _ < /proc/stat || return 0
+      t=$((u + n + s + i + w + q + sq + st)); idle=$((i + w))
+      mem=$(awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { printf "%d\t%d", (t - a) / 1024, t / 1024 }' /proc/meminfo)
+      [ "$pt" -gt 0 ] && [ "$t" -gt "$pt" ] && printf '%s\t%s\t%s\n' "$(ms)" $(( 1000 * ((t - pt) - (idle - pi)) / (t - pt) )) "$mem" >> "$out"
+      pt=$t; pi=$idle; sleep 1
+    done
+  fi
+  local cpus page total
+  cpus=$(vmcpus); page=$(sysctl -n hw.pagesize 2>/dev/null || echo 4096); total=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1048576 ))
+  [ "$cpus" -gt 0 ] && [ "$total" -gt 0 ] || return 0
+  while :; do
+    printf '%s\t%s\t%s\t%s\n' "$(ms)" \
+      "$(ps -A -o %cpu= | awk -v n="$cpus" '{ s += $1 } END { v = int(s * 10 / n); print (v > 1000 ? 1000 : v) }')" \
+      "$(vm_stat | awk -v p="$page" '/Pages active|Pages wired|occupied by compressor/ { gsub(/\./, "", $NF); s += $NF } END { printf "%d", s * p / 1048576 }')" "$total" >> "$OUTRUN_RUN_DIR/load.tsv"
+    sleep 1
+  done
+}
+# A step's load from its samples since $1 (ms): "avg peak memPeak memTotal" (permille, MB), or nothing.
+# A step shorter than the sampling (or a sampler slow to start) gets the job's latest sample.
+stepload() { awk -F '\t' -v t="$1" '{ last = $0 } $1 >= t { n++; s += $2; if ($2 > p) p = $2; if ($3 > m) m = $3; tot = $4 } END { if (n) printf "%d %d %d %d", s / n, p, m, tot; else if (last != "") { split(last, f, "\t"); printf "%d %d %d %d", f[2], f[2], f[3], f[4] } }' "$OUTRUN_RUN_DIR/load.tsv" 2>/dev/null; }
+# The line the job's log gets after a step: its time and the VM's load during it.
+loadline() {
+  local label=$1 took=$2 avg peak mem tot
+  read -r avg peak mem tot <<<"$3"
+  if [ -n "$<avg:-}" ]; then
+    printf '── %s: %d.%d s · CPU %d%% avg, %d%% peak of %s vCPU · memory %d.%d GB peak of %d GB\n' "$label" $((took / 1000)) $((took % 1000 / 100)) $(((avg + 5) / 10)) $(((peak + 5) / 10)) "$OUTRUN_CPUS" $((mem / 1024)) $((mem % 1024 * 10 / 1024)) $(((tot + 512) / 1024))
+  else
+    printf '── %s: %d.%d s\n' "$label" $((took / 1000)) $((took % 1000 / 100))
+  fi
+}
 `.replaceAll("$<", "${");
 
 /**
@@ -160,9 +207,14 @@ export const compileJob = (workflow: Workflow, job: Job, scope: Scope, env: Read
     // Removed when the job ends, whatever its outcome (OUT-56: never removed, 419 left on a laptop by
     // the tests); its result is written outside it (OUTRUN_RUN_RESULT).
     `export OUTRUN_RUN_DIR=$(mktemp -d "\${TMPDIR:-/tmp}/outrun-run.XXXXXX")`,
-    "trap 'rm -rf \"$OUTRUN_RUN_DIR\"' EXIT",
     'mkdir -p "$OUTRUN_RUN_DIR/tmp" "$OUTRUN_RUN_DIR/steps"',
     ': > "$OUTRUN_RUN_DIR/steps.tsv"',
+    // The VM's load while the job runs (`sampler`), stopped with the job. Off the job's output: its
+    // `sleep 1`, left running a moment after the kill, held the job's stdout open, so whoever read it
+    // to its end (a pipe, outrun/oss's tests) waited up to 1 s more for each job (27 s instead of 3
+    // for run.test.ts, the one-file presubmit's longest check, 2026-11-11).
+    "OUTRUN_CPUS=$(vmcpus); sampler </dev/null >/dev/null 2>&1 & outrun_sampler=$!",
+    'trap \'kill "$outrun_sampler" 2>/dev/null; rm -rf "$OUTRUN_RUN_DIR"\' EXIT',
     'export RUNNER_TEMP="$OUTRUN_RUN_DIR/tmp" GITHUB_WORKSPACE="$PWD" GITHUB_STEP_SUMMARY="$OUTRUN_RUN_DIR/summary.md"',
     "export GITHUB_SHA=$(git rev-parse HEAD)",
     // A job with no actions/checkout gets no tree, as on GitHub: an empty workspace.
@@ -220,7 +272,7 @@ export const compileJob = (workflow: Workflow, job: Job, scope: Scope, env: Read
           : []),
         `  printf '%s' ${word(toText(raw.run as Value), staticScope)} > ${file}`,
         ...(wd ? [`  cd ${word(wd, staticScope)} || exit 1`] : []),
-        `  exec ${stepTimeout ? `timeout --kill-after=10 ${Math.max(1, Math.round(stepTimeout * 60))} ` : ""}${command}`,
+        `  ${stepTimeout ? `steptimeout ${Math.max(1, Math.round(stepTimeout * 60))}` : "exec"} ${command}`,
         `) </dev/null; code=$?`,
         'ghfile "$OUTRUN_RUN_DIR/env" setenv',
         `while IFS= read -r p || [ -n "$p" ]; do [ -z "$p" ] || export PATH="$p:$PATH"; done < "$OUTRUN_RUN_DIR/path"`,
@@ -228,13 +280,14 @@ export const compileJob = (workflow: Workflow, job: Job, scope: Scope, env: Read
       );
     }
     body.push(
-      "took=$(( $(ms) - t ))",
+      'took=$(( $(ms) - t )); load=$(stepload "$t")',
       'if [ "$code" = 0 ]; then outcome=success; else outcome=failure; fi',
       `conclusion=$outcome; ${continueOnError ? '[ "$outcome" = success ] || conclusion=success' : ":"}`,
       `printf '%s' "$outcome" > ${dir}/outcome; printf '%s' "$conclusion" > ${dir}/conclusion`,
       '[ "$conclusion" = success ] || status=failure',
       `[ "$code" = 0 ] || echo ${q(`── ${label}: `)}"exit $code"`,
-      `record ${q(name)} "$outcome" "$conclusion" "$took"`,
+      `loadline ${q(label)} "$took" "$load"`,
+      `record ${q(name)} "$outcome" "$conclusion" "$took" "$load"`,
     );
     lines.push(
       `if { [ "$status" = success ] && ${when.success}; } || { [ "$status" = failure ] && ${when.failure}; }; then`,
@@ -253,7 +306,7 @@ export const compileJob = (workflow: Workflow, job: Job, scope: Scope, env: Read
       ([key, value]) =>
         `outputs=$(jq -c --arg k ${q(key)} --arg v ${word(typeof value === "string" ? value : toText(value as Value), staticScope)} '. + {($k): $v}' <<<"$outputs")`,
     ),
-    `jq -n -c --argjson outputs "$outputs" --rawfile steps "$OUTRUN_RUN_DIR/steps.tsv" '{outputs: $outputs, steps: ($steps | split("\\n") | map(select(length > 0) | split("\\t") | {name: .[0], outcome: .[1], conclusion: .[2], ms: (.[3] | tonumber)}))}' > "\${OUTRUN_RUN_RESULT:-/dev/null}"`,
+    `jq -n -c --arg cpus "\${OUTRUN_CPUS:-0}" --argjson outputs "$outputs" --rawfile steps "$OUTRUN_RUN_DIR/steps.tsv" '{outputs: $outputs, steps: ($steps | split("\\n") | map(select(length > 0) | split("\\t") | {name: .[0], outcome: .[1], conclusion: .[2], ms: (.[3] | tonumber)} + ((.[4] // "") | split(" ") | if length == 4 then {load: {cpu: (.[0] | tonumber), cpuPeak: (.[1] | tonumber), memMb: (.[2] | tonumber), memTotalMb: (.[3] | tonumber), cpus: ($cpus | tonumber)}} else {} end)))}' > "\${OUTRUN_RUN_RESULT:-/dev/null}"`,
     '[ "$status" = success ]',
   );
   return {

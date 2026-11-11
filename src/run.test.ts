@@ -114,6 +114,61 @@ describe("matrices as GitHub expands them", () => {
   });
 });
 
+describe("each step's time and the VM's load are in the job's log and the run's report", () => {
+  it("prints after a step its seconds, the VM's CPU (mean and peak of its cores) and its peak memory, without naming the machine's provider", async () => {
+    const yaml = `on: workflow_dispatch
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Busy
+        run: sleep 2.5
+`;
+    const { results, log } = await run(yaml);
+    expect(results).toEqual({ a: "success" });
+    // The load only when the sampler gave one (a busy runner may not within the step): its time always.
+    expect(log).toMatch(/── step 1\/1 · Busy: 2\.\d s( · CPU \d+% avg, \d+% peak of \d+ vCPU · memory \d+\.\d GB peak of \d+ GB)?\n/);
+    expect(log).toMatch(/ {2}Busy 2\.\d s( · CPU \d+% \(peak \d+%\) of \d+ · mem \d+\.\d\/\d+ GB)?\n/);
+    expect(log).not.toMatch(/boat|hetzner|tart/i);
+  });
+});
+
+describe("a job's output ends with its last step", () => {
+  it("leaves nothing of its load sampling holding its output open: a one-step job is read to its end at once", async () => {
+    const yaml = "on: workflow_dispatch\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n";
+    const t0 = Date.now();
+    const { results } = await run(yaml);
+    expect(results).toEqual({ a: "success" });
+    // 1 s and more while the sampler's sleep held the job's stdout.
+    expect(Date.now() - t0).toBeLessThan(900);
+  });
+});
+
+describe("a job with runs-on: outrun-macos runs on a macOS VM, as an ordinary GitHub Actions job", () => {
+  it("gives its cell the macOS OS, RUNNER_OS and runner.os, and its Linux neighbours Linux", async () => {
+    const yaml = `on: workflow_dispatch
+jobs:
+  mac:
+    runs-on: outrun-macos
+    steps:
+      - run: echo "os=$RUNNER_OS \${{ runner.os }} $RUNNER_ARCH"
+  linux:
+    runs-on: [self-hosted, outrun]
+    steps:
+      - run: echo "os=$RUNNER_OS \${{ runner.os }}"
+`;
+    const { cells, results } = await run(yaml);
+    expect(results).toEqual({ mac: "success", linux: "success" });
+    const byJob = Object.fromEntries(cells.map((cell) => [cell.job, cell]));
+    expect(byJob.mac!.os).toBe("macos");
+    expect(byJob.mac!.script).toContain("export RUNNER_OS='macOS'");
+    expect(byJob.mac!.script).toContain(`echo "os=$RUNNER_OS ''macOS'' $RUNNER_ARCH"`);
+    expect(byJob.linux!.os).toBe("linux");
+    expect(byJob.linux!.script).toContain("export RUNNER_OS='Linux'");
+    expect(byJob.linux!.script).toContain(`echo "os=$RUNNER_OS ''Linux''"`);
+  });
+});
+
 describe("outrun run refuses what it cannot run as GitHub does, before anything runs", () => {
   it("names the feature, the file and the line", async () => {
     const yaml = `on: workflow_dispatch
@@ -146,7 +201,7 @@ jobs:
       - run: true
 `;
     const { exit } = await run(yaml);
-    expect(refusal(exit)).toContain("runs-on macos-15");
+    expect(refusal(exit)).toContain("runs-on macos-15: outrun run runs Linux jobs and outrun-macos ones only");
     const lfs = await run(
       `on: workflow_dispatch\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v5\n        with:\n          lfs: true\n      - run: true\n`,
     );
@@ -352,6 +407,29 @@ jobs:
       "- long: timeout-minutes 90 is over outrun's cap: 15 min",
     ]);
   });
+  it("stops a step at its timeout-minutes with the macOS guest's tools only: /bin/bash 3.2, no GNU timeout", async () => {
+    const yaml = `on: workflow_dispatch
+jobs:
+  a:
+    runs-on: outrun-macos
+    steps:
+      - run: echo before
+      - run: sleep 30
+        timeout-minutes: 0.02
+      - if: always()
+        run: echo after
+`;
+    const cells: Cell[] = [];
+    await run(yaml).then((r) => cells.push(...r.cells));
+    const dir = mkdtempSync(join(tmpdir(), "outrun-run-"));
+    dirs.push(dir);
+    const t0 = Date.now();
+    const done = spawnSync("/bin/bash", ["-s"], { cwd: dir, input: cells[0]!.script, encoding: "utf8", env: { PATH: "/usr/bin:/bin", HOME: dir } });
+    expect(Date.now() - t0).toBeLessThan(15_000);
+    expect(done.status).not.toBe(0);
+    expect(done.stdout).toContain("before");
+    expect(done.stdout).toContain("after");
+  }, 30_000);
   it("is not run (NotRun) when the fleet does not run a cell", async () => {
     const parsed = parseWorkflow(
       "w.yml",
@@ -438,10 +516,10 @@ const fakeFleet = (slow?: string) => {
     events.set(id, list);
   };
   const layer = Layer.succeed(CheckApi, {
-    create: () =>
+    create: (_repo, _workers, _run, _main, os) =>
       Effect.sync(() => {
         const id = `c${++next}`;
-        calls.push(`create ${id}`);
+        calls.push(`create ${id}${os ? ` ${os}` : ""}`);
         push(id, { step: "up", code: 0, json: {} });
         return { id, sha: "a".repeat(40), workers: [{ name: `w-${id}`, mini: "mm1" }] };
       }),
@@ -457,7 +535,16 @@ const fakeFleet = (slow?: string) => {
         Effect.tap((name) =>
           Effect.sleep("20 millis").pipe(
             Effect.andThen(
-              Effect.sync(() => push(id, { step: "shard", code: 0, json: { job: { outputs: name.endsWith(":plan") ? { shards: "[1,2]" } : {}, steps: [] } } })),
+              Effect.sync(() =>
+                push(id, {
+                  step: "shard",
+                  code: 0,
+                  json: {
+                    job: { outputs: name.endsWith(":plan") ? { shards: "[1,2]" } : {}, steps: [] },
+                    host: { cpu: 634, cpuPeak: 981, memMb: 20582, memTotalMb: 32768, cpus: 12 },
+                  },
+                }),
+              ),
             ),
           ),
         ),
@@ -472,6 +559,32 @@ const fakeFleet = (slow?: string) => {
   });
   return { calls, layer };
 };
+
+describe("the host's load during a job is in the run's report, beside its VM's", () => {
+  it("prints on the job's line the whole host's CPU (mean and peak of its cores) and its peak memory", async () => {
+    const { layer } = fakeFleet();
+    const lines: string[] = [];
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const yaml = "on: workflow_dispatch\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n";
+        const { workflow, jobs, inputs } = yield* prepare("w.yml", yaml, [], [], "acme/app");
+        const f = yield* fleet(
+          "acme/app",
+          () => Effect.succeed("patch"),
+          () => Effect.succeed("m"),
+          undefined,
+          undefined,
+          {},
+        );
+        yield* runWorkflow(workflow, jobs, { repository: "acme/app", ref: "refs/heads/main", inputs }, f.runCell, (line) =>
+          Effect.sync(() => void lines.push(line)),
+        );
+        yield* f.close;
+      }).pipe(Effect.provide(layer)),
+    );
+    expect(lines.join("\n")).toMatch(/✓ a · [\d.]+ s on mm1, main at a{8} · host CPU 63% \(peak 98%\) of 12 · mem 20\.1\/32 GB/);
+  });
+});
 
 describe("VMs started ahead while a job's needs run", () => {
   const yaml = `on: workflow_dispatch
@@ -532,6 +645,41 @@ jobs:
     expect(calls).toContain("run w.yml:plan on c2");
     expect(calls.filter((c) => c.startsWith("create"))).toHaveLength(3);
     expect(calls.filter((c) => c.startsWith("end")).sort()).toEqual(["end c1", "end c2", "end c3"]);
+  });
+
+  it("takes a macOS job's VM from the macOS pool only, never a Linux VM started ahead", async () => {
+    const { calls, layer } = fakeFleet();
+    const mixed = `on: workflow_dispatch
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps: [{ run: "true" }]
+  mac:
+    needs: plan
+    runs-on: outrun-macos
+    steps: [{ run: "true" }]
+`;
+    const { results } = await Effect.runPromise(
+      Effect.gen(function* () {
+        const { workflow, jobs, inputs } = yield* prepare("w.yml", mixed, [], [], "acme/app");
+        const f = yield* fleet(
+          "acme/app",
+          () => Effect.succeed("patch"),
+          () => Effect.succeed("m"),
+          undefined,
+          undefined,
+          { mac: 1 },
+        );
+        const results = yield* runWorkflow(workflow, jobs, { repository: "acme/app", ref: "refs/heads/main", inputs }, f.runCell, () => Effect.void, f.ahead);
+        yield* f.close;
+        return { results: Object.fromEntries(results) };
+      }).pipe(Effect.provide(layer)),
+    );
+    expect(results).toEqual({ plan: "success", mac: "success" });
+    // The plan's Linux VM, and the macOS one started ahead while the plan ran.
+    expect(calls.filter((c) => c.startsWith("create"))).toEqual(["create c1", "create c2 macos"]);
+    expect(calls).toContain("run w.yml:plan on c1");
+    expect(calls).toContain("run w.yml:mac on c2");
   });
 
   it("with nothing learned, starts a job's VMs once its needs ran", async () => {

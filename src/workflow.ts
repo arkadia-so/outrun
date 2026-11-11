@@ -249,8 +249,16 @@ const githubKeys = (node: Node): string[] => {
   return keys;
 };
 
-/** A job's runs-on labels refused: outrun run v1 runs Linux jobs only (on arm64 VMs). */
-export const runsOnRefusal = (labels: Value): string | null => {
+/** The OS a job's VM runs: Linux (arm64), or macOS for outrun's own Mac labels. */
+export type Os = "linux" | "macos";
+
+/**
+ * The OS of a job's runs-on labels, or why outrun run cannot run it: outrun's Mac labels
+ * (`outrun-macos`, its `-priority` and `-flex` tiers) run on a macOS VM of the Mac CI's image, any
+ * other Mac, Windows or Xcode label is refused (GitHub's `macos-15` names an image outrun does not
+ * have), and every other label runs on Linux.
+ */
+export const runsOnOf = (labels: Value): Os | { readonly refused: string } => {
   const list = Array.isArray(labels)
     ? labels.map(String)
     : typeof labels === "string"
@@ -258,9 +266,11 @@ export const runsOnRefusal = (labels: Value): string | null => {
       : labels && typeof labels === "object"
         ? null
         : [String(labels)];
-  if (!list) return "runs-on as a group is not supported by outrun run v1";
-  const other = list.find((label) => /mac|windows|xcode/i.test(label));
-  return other ? `runs-on ${other}: outrun run v1 runs Linux jobs only` : null;
+  if (!list) return { refused: "runs-on as a group is not supported by outrun run v1" };
+  const macos = list.some((label) => /^outrun-macos(-priority|-flex)?$/.test(label));
+  const other = list.find((label) => /mac|windows|xcode/i.test(label) && !/^outrun-macos(-priority|-flex)?$/.test(label));
+  if (other) return { refused: `runs-on ${other}: outrun run runs Linux jobs and outrun-macos ones only` };
+  return macos ? "macos" : "linux";
 };
 
 /** A reference the job's script resolves while it runs: `steps.<id>.outputs.<name>`, `steps.<id>.(outcome|conclusion)` or `env.<NAME>`. */

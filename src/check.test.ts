@@ -16,6 +16,7 @@ import {
   splitUnits,
   timeUnits,
   type Unit,
+  waitFor,
 } from "./check.ts";
 
 const SHA = "a".repeat(40);
@@ -247,6 +248,20 @@ describe("outrun check", () => {
       const b = yield* Effect.flip(runRepoCheck(2).pipe(Effect.provide(lost.layer)));
       expect(b).toMatchObject({ _tag: "NotRun", message: "worker chk-c-1 was lost: mm2 left the fleet" });
       expect(lost.calls.at(-1)).toBe("end c");
+    }),
+  );
+
+  it.effect("a worker lost after its up failed says why the up failed, not only that it was lost", () =>
+    Effect.gen(function* () {
+      const events: CheckEvent[] = [
+        { seq: 1, worker: "chk-c-0", step: "up", code: 1, ms: 5, json: {}, log: "setup: bun: command not found" },
+        { seq: 2, worker: "chk-c-0", step: "lost", code: -1, ms: 0, json: {}, log: "apply: no VM chk-c-0 on this Mini" },
+      ];
+      const api = Layer.succeed(CheckApi, {
+        events: (_id: string, after: number) => Effect.succeed(events.filter((e) => e.seq > after)),
+      } as unknown as CheckApi["Service"]);
+      const error = yield* Effect.flip(waitFor("c", 0, () => false, Date.now() + 5_000, Date.now()).pipe(Effect.provide(api)));
+      expect(error).toMatchObject({ _tag: "NotRun", message: "worker chk-c-0: up exit 1: setup: bun: command not found" });
     }),
   );
 

@@ -320,7 +320,7 @@ export default { /* tests, targets */ agents: { default: { model: gateway("fast"
 ## outrun run: a workflow on outrun's VMs, from your tree
 
 `outrun run <workflow>` (since 1.9) runs one of the repository's GitHub Actions workflows on outrun's
-Linux VMs against your tree: HEAD with its uncommitted and untracked changes (or exactly a commit,
+VMs against your tree (Linux arm64, and macOS for a job with `runs-on: outrun-macos`, since 1.10): HEAD with its uncommitted and untracked changes (or exactly a commit,
 `--ref <sha>`), sent as a patch, so GitHub never sees it. Each job's steps and log come back in the
 terminal. Nothing outrun-specific is configured: the workflow is the one GitHub runs.
 
@@ -340,7 +340,9 @@ OUTRUN_API_TOKEN=ort_... OUTRUN_INSTALLATION=<id> OUTRUN_GITHUB_TOKEN=<a token t
 - Anything it would run differently from GitHub is refused before anything runs (exit 2), naming
   the feature, the file and the line: other actions (`uses:`), `services`, `container`,
   `concurrency`, `environment`, `secrets`, `vars`, `github.token`, `hashFiles()`, checkout `ref` or
-  `path`, a macOS or Windows `runs-on`.
+  `path`, a Mac or Windows `runs-on` other than `outrun-macos`.
+- A job with `runs-on: outrun-macos` runs on a macOS VM with Xcode, as on outrun's Mac runners
+  (`RUNNER_OS` and `runner.os` are `macOS`); its steps run on macOS's own bash and tools.
 - A job waiting for its `needs` gets its VMs started meanwhile, as many as it ran matrix cells last
   time (learned per repository, workflow and job in `~/.cache/outrun/run-cells.json`; nothing to
   configure), so a planner's shards start on VMs already up with your tree.

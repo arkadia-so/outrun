@@ -78,7 +78,8 @@ export class CheckApi extends Context.Service<
     // and no worker plans.
     // `main`: the commit of main the change is on (the push's base), so the fleet rebuilds warms
     // behind it (outrun 1.9.4).
-    readonly create: (repo: string, workers: number, run?: boolean, main?: string) => Effect.Effect<Created, NotRun>;
+    // `os`: a macOS VM (a run's `runs-on: outrun-macos` job), else Linux.
+    readonly create: (repo: string, workers: number, run?: boolean, main?: string, os?: "macos") => Effect.Effect<Created, NotRun>;
     // `patches`: HEAD's tree as a patch on each warm commit the workers start from (by sha);
     // `message`: the commit messages of the change (Repo `messageFrom`), the VM's commit's;
     // `change`: the push's base to HEAD (Repo `base`), absent when the clone has no remote main.
@@ -183,6 +184,10 @@ export const waitFor = (id: string, from: number, done: (events: readonly CheckE
       if (answer._tag === "None") continue;
       for (const event of answer.value) {
         after = Math.max(after, event.seq);
+        // A worker whose `up` failed is lost at its next step (its VM destroyed): that `up` says why.
+        const cause = seen.find((e) => e.worker === event.worker && e.code > 0 && (e.step === "up" || e.step === "apply"));
+        if (event.step === "lost" && cause)
+          return yield* new NotRun({ message: `worker ${event.worker}: ${cause.step} exit ${cause.code}: ${cause.log.slice(-1500)}` });
         if (event.step === "lost") return yield* new NotRun({ message: `worker ${event.worker} was lost: ${event.log}` });
         // A step its Mini could not finish (its VM died, its guest stopped answering): says nothing of
         // the change (a control plane before OUT-45's sent it as is, read as a failure by 1.6.0).
@@ -215,7 +220,9 @@ export const runRepoCheck = (workers: number, targetMs = 30_000, { slackMs = CHE
     const t0 = Date.now();
     const cap = t0 + CHECK_MS;
     const name = yield* repo.name;
-    const check = yield* api.create(name, workers);
+    // The push's base: the commit a worker starts cold from when no Mini offers a warm yet.
+    const base = yield* repo.base;
+    const check = yield* api.create(name, workers, undefined, base?.sha);
     return yield* Effect.gen(function* () {
       const n = check.workers.length;
       // Fewer workers than asked: said at once, the check slower than its split for `workers`; none
@@ -228,7 +235,6 @@ export const runRepoCheck = (workers: number, targetMs = 30_000, { slackMs = CHE
       for (const sha of new Set([check.sha, ...check.workers.map((w) => w.sha ?? check.sha)])) patches[sha] = yield* repo.patchFrom(sha);
       // The plan against the push's base, not the warm's commit: a warm behind main otherwise counts
       // every commit landed since as the push's (outrun 1.8). The VM commits the base, then the change.
-      const base = yield* repo.base;
       yield* api.patch(check.id, check.sha, patches, yield* repo.messageFrom(base?.sha ?? check.sha), base?.change);
       // Every worker up and patched; the first's apply carries the plan.
       const ready = yield* waitFor(check.id, 0, (events) => events.filter((e) => e.step === "apply").length === n, Math.min(cap, t0 + READY_MS), t0);
@@ -416,11 +422,11 @@ export const checkApiLive = (api: string, installation: string, token: string, g
       ),
     );
   return Layer.succeed(CheckApi, {
-    create: (repo, workers, run, main) =>
+    create: (repo, workers, run, main, os) =>
       request("", {
         method: "POST",
         // `bases`: this CLI sends a patch for each warm commit, so workers may start from several.
-        body: { protocol: CHECK_PROTOCOL, repo, workers, bases: true, ...(run ? { run: true } : {}), ...(main ? { main } : {}) },
+        body: { protocol: CHECK_PROTOCOL, repo, workers, bases: true, ...(run ? { run: true } : {}), ...(main ? { main } : {}), ...(os ? { os } : {}) },
         ...(githubToken ? { headers: { "x-github-token": githubToken } } : {}),
       }).pipe(Effect.map((body) => body as unknown as Created)),
     patch: (id, sha, patches, message, change) =>

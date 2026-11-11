@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-// `outrun run <workflow>`: a GitHub Actions workflow run on outrun's Linux VMs against this tree, its
+// `outrun run <workflow>`: a GitHub Actions workflow run on outrun's VMs (Linux, or macOS for
+// `runs-on: outrun-macos`) against this tree, its
 // verdict and its logs in the terminal (outrun/README.md "outrun run"). The tree: HEAD with the
 // working tree's changes, untracked files included (or exactly a commit, `--ref`), sent as a patch on
 // the warm commit of the Minis, so GitHub never sees it. Each job runs as GitHub runs it (needs,
@@ -39,10 +40,11 @@ import {
   dispatchInputs,
   expandMatrix,
   type Job,
+  type Os,
   parseWorkflow,
   type Refusal,
   refusalsOf,
-  runsOnRefusal,
+  runsOnOf,
   selectJobs,
   type Workflow,
 } from "./workflow.ts";
@@ -65,7 +67,26 @@ interface StepLine {
   readonly outcome: string;
   readonly conclusion: string;
   readonly ms: number;
+  // The VM's load during the step (job-script.ts `sampler`): CPU in permille of its `cpus`, memory in MB.
+  readonly load?: Load;
 }
+// CPU in permille of `cpus`, memory in MB.
+interface Load {
+  readonly cpu: number;
+  readonly cpuPeak: number;
+  readonly memMb: number;
+  readonly memTotalMb: number;
+  readonly cpus: number;
+}
+const isLoad = (value: unknown): value is Load =>
+  typeof value === "object" &&
+  value !== null &&
+  ["cpu", "cpuPeak", "memMb", "memTotalMb", "cpus"].every((k) => typeof (value as Record<string, unknown>)[k] === "number");
+// A step's load as the report shows it: "CPU 63% (peak 98%) of 10 · mem 9.1/16 GB".
+const loadText = (load: Load | undefined) =>
+  load
+    ? ` · CPU ${Math.round(load.cpu / 10)}% (peak ${Math.round(load.cpuPeak / 10)}%) of ${load.cpus} · mem ${(load.memMb / 1024).toFixed(1)}/${Math.round(load.memTotalMb / 1024)} GB`
+    : "";
 export interface Ran {
   readonly result: "success" | "failure";
   readonly outputs: Readonly<Record<string, string>>;
@@ -73,6 +94,8 @@ export interface Ran {
   readonly log: string;
   readonly ms: number;
   readonly where: string;
+  // The whole host's load during the job (its agent's `host`, Mac agent 66): what its neighbours took.
+  readonly host?: Load;
 }
 export interface Cell {
   readonly job: string;
@@ -80,6 +103,8 @@ export interface Cell {
   readonly id: string;
   readonly script: string;
   readonly timeoutMs: number;
+  // Its VM's OS, from its runs-on (workflow.ts runsOnOf).
+  readonly os: Os;
 }
 export type RunCell<R = never> = (cell: Cell) => Effect.Effect<Ran, NotRun, R>;
 /**
@@ -88,7 +113,7 @@ export type RunCell<R = never> = (cell: Cell) => Effect.Effect<Ran, NotRun, R>;
  * them; 0 when it was skipped). Neither changes what runs: only when its VMs are ready.
  */
 export interface Ahead<R = never> {
-  readonly start: (job: string) => Effect.Effect<void, never, R>;
+  readonly start: (job: string, os: Os) => Effect.Effect<void, never, R>;
   readonly settle: (job: string, cells: number) => Effect.Effect<void, never, R>;
 }
 
@@ -117,7 +142,9 @@ const githubOf = (workflow: Workflow, job: Job, context: Context) => ({
   server_url: "https://github.com",
   api_url: "https://api.github.com",
 });
-const envOf = (github: ReturnType<typeof githubOf>) => ({
+// GitHub's runner context for a VM of `os` (both arm64).
+const runnerOf = (os: Os) => ({ os: os === "macos" ? "macOS" : "Linux", arch: "ARM64" });
+const envOf = (github: ReturnType<typeof githubOf>, os: Os) => ({
   CI: "true",
   GITHUB_ACTIONS: "true",
   GITHUB_REPOSITORY: github.repository,
@@ -130,8 +157,8 @@ const envOf = (github: ReturnType<typeof githubOf>) => ({
   GITHUB_JOB: github.job,
   GITHUB_SERVER_URL: github.server_url,
   GITHUB_API_URL: github.api_url,
-  RUNNER_OS: "Linux",
-  RUNNER_ARCH: "ARM64",
+  RUNNER_OS: runnerOf(os).os,
+  RUNNER_ARCH: runnerOf(os).arch,
 });
 
 // A value of the workflow with its expressions evaluated (a matrix, runs-on), recursively; a string
@@ -165,11 +192,13 @@ export const runWorkflow = <R>(
     const runJob = (job: Job) =>
       Effect.gen(function* () {
         const needs: Record<string, { result: Result; outputs: Record<string, string> }> = {};
-        if (ahead && job.needs.length > 0) yield* ahead.start(job.id);
+        // VMs ahead only for a runs-on known before the needs ran (no expression in it).
+        const early = JSON.stringify(job.raw["runs-on"] ?? null).includes("${{") ? null : runsOnOf(resolveValue(job.raw["runs-on"], { contexts: {} }));
+        if (ahead && job.needs.length > 0 && typeof early === "string") yield* ahead.start(job.id, early);
         for (const need of job.needs) needs[need] = yield* Deferred.await(done.get(need)!);
         const github = githubOf(workflow, job, context);
         const base: Scope = {
-          contexts: { github, inputs: context.inputs, needs, runner: { os: "Linux", arch: "ARM64" } },
+          contexts: { github, inputs: context.inputs, needs },
           status: Object.values(needs).some((n) => n.result === "failure")
             ? "failure"
             : Object.values(needs).every((n) => n.result === "success")
@@ -210,22 +239,30 @@ export const runWorkflow = <R>(
                 yield* print(`- ${name}: cancelled (fail-fast)`);
                 return { result: "failure" as const, outputs: {} };
               }
-              const refused = runsOnRefusal(resolveValue(job.raw["runs-on"], scope));
-              if (refused) return yield* refuse(refused);
-              const { capped, ...compiled } = compileJob(workflow, job, scope, { ...envOf(github), ...context.env });
+              const os = runsOnOf(resolveValue(job.raw["runs-on"], scope));
+              if (typeof os !== "string") return yield* refuse(os.refused);
+              const { capped, ...compiled } = compileJob(
+                workflow,
+                job,
+                { ...scope, contexts: { ...scope.contexts, runner: runnerOf(os) } },
+                { ...envOf(github, os), ...context.env },
+              );
               if (capped && index === 0)
                 yield* print(
                   `- ${job.id}: timeout-minutes ${capped.minutes}${capped.byDefault ? " (GitHub's default)" : ""} is over outrun's cap: ${RUN_MAX_MINUTES} min`,
                 );
-              const result = yield* permits.withPermits(1)(runCell({ job: job.id, name, id: `${workflow.path}:${name}`, ...compiled }));
+              const result = yield* permits.withPermits(1)(runCell({ job: job.id, name, id: `${workflow.path}:${name}`, os, ...compiled }));
               const continueOnError = job.raw["continue-on-error"] !== undefined && truthy(resolveValue(job.raw["continue-on-error"], scope));
               const ok = result.result === "success" || continueOnError;
               const steps = result.steps.map(
                 (step) =>
-                  `${step.conclusion === "success" ? " " : step.conclusion === "skipped" ? "-" : "✗"} ${step.name} ${step.conclusion === "skipped" ? "skipped" : s(step.ms)}`,
+                  `${step.conclusion === "success" ? " " : step.conclusion === "skipped" ? "-" : "✗"} ${step.name} ${step.conclusion === "skipped" ? "skipped" : `${s(step.ms)}${loadText(step.load)}`}`,
               );
               yield* print(
-                [`${result.result === "success" ? "✓" : "✗"} ${name} · ${s(result.ms)} on ${result.where}`, ...steps.map((l) => `    ${l}`)].join("\n"),
+                [
+                  `${result.result === "success" ? "✓" : "✗"} ${name} · ${s(result.ms)} on ${result.where}${result.host ? ` · host${loadText(result.host).slice(2)}` : ""}`,
+                  ...steps.map((l) => `    ${l}`),
+                ].join("\n"),
               );
               if (result.log.trim()) yield* print(`--- ${name} ---\n${result.log.trimEnd()}\n---`);
               if (!ok) failed = true;
@@ -252,6 +289,7 @@ const AHEAD_FRESH_MS = 60_000;
 // A VM of the run, restored and patched with the tree, waiting for its cell's program.
 interface Ready {
   readonly id: string;
+  readonly os: Os;
   readonly mini: string;
   readonly sha: string;
   readonly after: number;
@@ -261,8 +299,8 @@ interface Ready {
 /**
  * The cells on the fleet: each one check of one worker (outrun check's create, patch, shard), its
  * program as the shard; `patchOf` HEAD's tree on a warm commit, once per commit for the whole run.
- * Every VM of a run is the same (the repository's warm, patched with the tree), so the VMs form one
- * pool and a cell takes the first ready. A job waiting for its needs adds to it as many VMs as it ran
+ * Every VM of a run of one OS is the same (the repository's warm of that OS, patched with the tree),
+ * so the VMs form one pool per OS and a cell takes the first ready of its own. A job waiting for its needs adds to it as many VMs as it ran
  * cells last time (`cells`, by job id), so its cells start on VMs already up and patched and its needs
  * on the first ready; `close` ends what the run did not use.
  */
@@ -279,66 +317,71 @@ export const fleet = (
     const api = yield* CheckApi;
     // VMs ready and not given to a cell yet, by check id.
     const idle = new Set<string>();
-    // The VMs coming (starting or ready in `pool`) that no cell has claimed yet.
-    let coming = 0;
-    const pool = yield* Queue.unbounded<Exit.Exit<Ready, NotRun>>();
+    // Per OS: the VMs coming (starting or ready in `pool`) that no cell has claimed yet.
+    const pools = {
+      linux: { coming: 0, pool: yield* Queue.unbounded<Exit.Exit<Ready, NotRun>>() },
+      macos: { coming: 0, pool: yield* Queue.unbounded<Exit.Exit<Ready, NotRun>>() },
+    };
     // The VMs' starts belong to the run, not to the cell or job that asked for them.
     const starts = yield* Scoped.make();
     const learned: Record<string, number> = {};
 
     // A VM up and patched, or NotRun; a check created and then failed or interrupted is ended.
-    const acquire = Effect.gen(function* () {
-      const t0 = Date.now();
-      // No VM free now: the run's other cells hold some, so this one waits its turn, within READY_MS.
-      const check = yield* api
-        .create(repo, 1, true, base?.sha)
-        .pipe(Effect.retry({ schedule: Schedule.spaced("3 seconds"), while: (e) => / 409 full\b/.test(e.message) && Date.now() - t0 < READY_MS }));
-      return yield* Effect.gen(function* () {
-        const worker = check.workers[0];
-        if (!worker) return yield* new NotRun({ message: "the fleet gave no VM" });
-        const sha = worker.sha ?? check.sha;
-        yield* api.patch(check.id, check.sha, { [sha]: yield* patchOf(sha) }, yield* message(base?.sha ?? sha), base?.change);
-        const ready = yield* waitFor(check.id, 0, (events) => events.some((e) => e.step === "apply"), t0 + READY_MS, t0);
-        const broken = ready.events.find((e) => e.code !== 0);
-        if (broken) return yield* new NotRun({ message: `${broken.worker} ${broken.step}: exit ${broken.code}: ${broken.log.slice(-500)}` });
-        idle.add(check.id);
-        return { id: check.id, mini: worker.mini, sha, after: ready.after, at: Date.now() } satisfies Ready;
-      }).pipe(Effect.onError(() => api.end(check.id)));
-    });
+    const acquire = (os: Os) =>
+      Effect.gen(function* () {
+        const t0 = Date.now();
+        // No VM free now: the run's other cells hold some, so this one waits its turn, within READY_MS.
+        const check = yield* api
+          .create(repo, 1, true, base?.sha, os === "macos" ? "macos" : undefined)
+          .pipe(Effect.retry({ schedule: Schedule.spaced("3 seconds"), while: (e) => / 409 full\b/.test(e.message) && Date.now() - t0 < READY_MS }));
+        return yield* Effect.gen(function* () {
+          const worker = check.workers[0];
+          if (!worker) return yield* new NotRun({ message: "the fleet gave no VM" });
+          const sha = worker.sha ?? check.sha;
+          yield* api.patch(check.id, check.sha, { [sha]: yield* patchOf(sha) }, yield* message(base?.sha ?? sha), base?.change);
+          const ready = yield* waitFor(check.id, 0, (events) => events.some((e) => e.step === "apply"), t0 + READY_MS, t0);
+          const broken = ready.events.find((e) => e.code !== 0);
+          if (broken) return yield* new NotRun({ message: `${broken.worker} ${broken.step}: exit ${broken.code}: ${broken.log.slice(-500)}` });
+          idle.add(check.id);
+          return { id: check.id, os, mini: worker.mini, sha, after: ready.after, at: Date.now() } satisfies Ready;
+        }).pipe(Effect.onError(() => api.end(check.id)));
+      });
 
-    const start = Effect.gen(function* () {
-      coming++;
-      yield* Effect.forkIn(
-        acquire.pipe(
-          Effect.exit,
-          Effect.flatMap((exit) => Queue.offer(pool, exit)),
-        ),
-        starts,
-      );
-    });
+    const start = (os: Os) =>
+      Effect.gen(function* () {
+        pools[os].coming++;
+        yield* Effect.forkIn(
+          acquire(os).pipe(
+            Effect.exit,
+            Effect.flatMap((exit) => Queue.offer(pools[os].pool, exit)),
+          ),
+          starts,
+        );
+      });
 
     const ahead: Ahead<CheckApi> = {
-      start: (job) => Effect.forEach(Array.from({ length: Math.min(cells[job] ?? 0, MAX_CELLS) }), () => start, { discard: true }),
+      start: (job, os) => Effect.forEach(Array.from({ length: Math.min(cells[job] ?? 0, MAX_CELLS) }), () => start(os), { discard: true }),
       settle: (job, ran) => Effect.sync(() => void (ran > 0 && (learned[job] = ran))),
     };
 
     // The first VM ready, one started for it when none is coming unclaimed. One older than
     // AHEAD_FRESH_MS is ended and the next taken; one that failed to start, another started for it.
-    const vm: Effect.Effect<Ready, NotRun, CheckApi> = Effect.gen(function* () {
-      if (coming === 0) yield* start;
-      coming--;
-      const exit = yield* Queue.take(pool);
-      if (Exit.isFailure(exit)) return yield* acquire.pipe(Effect.tap((ready) => Effect.sync(() => idle.delete(ready.id))));
-      idle.delete(exit.value.id);
-      if (Date.now() - exit.value.at < AHEAD_FRESH_MS) return exit.value;
-      yield* api.end(exit.value.id);
-      return yield* vm;
-    });
+    const vm = (os: Os): Effect.Effect<Ready, NotRun, CheckApi> =>
+      Effect.gen(function* () {
+        if (pools[os].coming === 0) yield* start(os);
+        pools[os].coming--;
+        const exit = yield* Queue.take(pools[os].pool);
+        if (Exit.isFailure(exit)) return yield* acquire(os).pipe(Effect.tap((ready) => Effect.sync(() => idle.delete(ready.id))));
+        idle.delete(exit.value.id);
+        if (Date.now() - exit.value.at < AHEAD_FRESH_MS) return exit.value;
+        yield* api.end(exit.value.id);
+        return yield* vm(os);
+      });
 
     const runCell: RunCell<CheckApi> = (cell) =>
       Effect.gen(function* () {
         const t0 = Date.now();
-        const got = yield* vm.pipe(Effect.mapError((e) => new NotRun({ message: `${cell.name}: ${e.message}` })));
+        const got = yield* vm(cell.os).pipe(Effect.mapError((e) => new NotRun({ message: `${cell.name}: ${e.message}` })));
         return yield* Effect.gen(function* () {
           yield* api.shards(got.id, [
             {
@@ -353,14 +396,20 @@ export const fleet = (
           const shard = ran.events.find((e) => e.step === "shard")!;
           const job = (shard.json.job ?? null) as { outputs?: Record<string, unknown>; steps?: StepLine[] } | null;
           // A shard that ran no job script (an agent before `outrun run`) is not a verdict.
-          if (!job && shard.code === 0) return yield* new NotRun({ message: `${cell.name}: ${got.mini}'s agent reported no job: it predates outrun run` });
+          // A shard that ran no job script (an agent before `outrun run`), or whose result was lost, is
+          // not a verdict: what the agent did report is said, never guessed.
+          if (!job && shard.code === 0)
+            return yield* new NotRun({
+              message: `${cell.name}: ${got.mini}'s agent reported no job result (exit 0, ${shard.ms} ms; reported ${JSON.stringify(Object.keys(shard.json))}); its log ends: ${shard.log.slice(-600)}`,
+            });
           return {
             result: shard.code === 0 ? ("success" as const) : ("failure" as const),
             outputs: Object.fromEntries(Object.entries(job?.outputs ?? {}).map(([k, v]) => [k, String(v)])),
             steps: Array.isArray(job?.steps) ? job.steps : [],
             log: shard.log,
             ms: Date.now() - t0,
-            where: `${got.mini}, main at ${got.sha.slice(0, 8)}`,
+            where: `${got.mini}${got.os === "macos" ? " (macOS)" : ""}, main at ${got.sha.slice(0, 8)}`,
+            ...(isLoad(shard.json.host) ? { host: shard.json.host } : {}),
           };
         }).pipe(Effect.ensuring(api.end(got.id)));
       });
@@ -526,5 +575,7 @@ const handler = ({
   });
 
 export const runCommand = Command.make("run", flags, handler).pipe(
-  Command.withDescription("a GitHub Actions workflow on outrun's Linux VMs against this tree (exit 0 passed, 1 failed, 2 refused, 3 not run)"),
+  Command.withDescription(
+    "a GitHub Actions workflow on outrun's VMs (Linux, macOS for runs-on outrun-macos) against this tree (exit 0 passed, 1 failed, 2 refused, 3 not run)",
+  ),
 );
