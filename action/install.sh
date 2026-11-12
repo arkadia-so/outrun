@@ -20,7 +20,7 @@ tools="${RUNNER_TOOL_CACHE:?}/outrun-bun/$BUN_VERSION"
 bun="$tools/bun"
 # The runner's own Bun at ~/.bun/bin (outrun's macOS image has it; setup-bun installs there), used
 # as it is when it is this exact build, checked by its binary's SHA-256 (`binary` above, the bun of
-# the release zip): no download. GitHub's release download answered 504 to outrun-macos jobs and
+# the release zip): no download. GitHub's release download answered 504 to outrun-macos-26 jobs and
 # took 11 s when it did not (OUT-45, 2026-11-09).
 own="${HOME:-}/.bun/bin/bun"
 if [ ! -x "$bun" ] && [ -n "${binary:-}" ] && [ -x "$own" ] && [ "$(shasum -a 256 "$own" | cut -d' ' -f1)" = "$binary" ]; then

@@ -11,7 +11,7 @@ name: outrun e2e
 # (`build-cache`) come back from the tiers before a build, so a new key builds incrementally:
 #
 #       with:
-#         runs-on: outrun-macos
+#         runs-on: outrun-macos-26
 #         install: npm ci
 #         build: ./scripts/build-simulator-app.sh
 #         build-inputs: ios/** package-lock.json
@@ -37,9 +37,9 @@ on:
         type: string
         default: e2e
       runs-on:
-        description: The runners' label (outrun-linux-arm64 for web targets, outrun-macos for an iOS simulator)
+        description: The runners' label (outrun-ubuntu-24.04-arm for web targets, outrun-macos-26 for an iOS simulator)
         type: string
-        default: outrun-linux-arm64
+        default: outrun-ubuntu-24.04-arm
       node-version:
         description: The Node e2e's CLI runs on (actions/setup-node; from the runner's tool cache when it has it)
         type: string
@@ -136,7 +136,7 @@ jobs:
       APP: ${{ inputs.app }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: arkadia-so/outrun@v1.10.0 # this release's own action: package.json's version (release.test.ts)
+      - uses: arkadia-so/outrun@v1.11.0 # this release's own action: package.json's version (release.test.ts)
       # Before planning, even with no install: Node's version is in the tests' keys.
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
@@ -277,7 +277,7 @@ jobs:
         shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: arkadia-so/outrun@v1.10.0 # this release's own action: package.json's version (release.test.ts)
+      - uses: arkadia-so/outrun@v1.11.0 # this release's own action: package.json's version (release.test.ts)
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: ${{ inputs.node-version }}
@@ -423,7 +423,7 @@ jobs:
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 10
     steps:
-      - uses: arkadia-so/outrun@v1.10.0 # this release's own action: package.json's version (release.test.ts)
+      - uses: arkadia-so/outrun@v1.11.0 # this release's own action: package.json's version (release.test.ts)
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: outrun-${{ inputs.name }}-shard-*

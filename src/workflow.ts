@@ -3,6 +3,7 @@
 // subset before anything runs, a refusal naming the feature, the file and the line; then a job's
 // matrix expanded and its contexts made, as GitHub makes them for a `workflow_dispatch`.
 import { condition, ExprError, interpolate, type Node, pathOf, type Scope, template, uses, type Value } from "./expr.ts";
+import { outrunLabel } from "./labels.ts";
 
 export interface Refusal {
   readonly line: number;
@@ -253,10 +254,10 @@ const githubKeys = (node: Node): string[] => {
 export type Os = "linux" | "macos";
 
 /**
- * The OS of a job's runs-on labels, or why outrun run cannot run it: outrun's Mac labels
- * (`outrun-macos`, its `-priority` and `-flex` tiers) run on a macOS VM of the Mac CI's image, any
- * other Mac, Windows or Xcode label is refused (GitHub's `macos-15` names an image outrun does not
- * have), and every other label runs on Linux.
+ * The OS of a job's runs-on labels, or why outrun run cannot run it: outrun's macOS labels
+ * (labels.ts: `outrun-macos-26`, its deprecated alias `outrun-macos`, their `-priority` and `-flex`
+ * tiers) run on a macOS VM of the Mac CI's image, any other Mac, Windows or Xcode label is refused
+ * (GitHub's `macos-15` names an image outrun does not have), and every other label runs on Linux.
  */
 export const runsOnOf = (labels: Value): Os | { readonly refused: string } => {
   const list = Array.isArray(labels)
@@ -267,9 +268,10 @@ export const runsOnOf = (labels: Value): Os | { readonly refused: string } => {
         ? null
         : [String(labels)];
   if (!list) return { refused: "runs-on as a group is not supported by outrun run v1" };
-  const macos = list.some((label) => /^outrun-macos(-priority|-flex)?$/.test(label));
-  const other = list.find((label) => /mac|windows|xcode/i.test(label) && !/^outrun-macos(-priority|-flex)?$/.test(label));
-  if (other) return { refused: `runs-on ${other}: outrun run runs Linux jobs and outrun-macos ones only` };
+  const own = list.map((label) => outrunLabel([label]));
+  const macos = own.some((label) => label?.os === "macos");
+  const other = list.find((label, i) => /mac|windows|xcode/i.test(label) && own[i]?.os !== "macos");
+  if (other) return { refused: `runs-on ${other}: outrun run runs Linux jobs and outrun-macos-26 ones only` };
   return macos ? "macos" : "linux";
 };
 

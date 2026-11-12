@@ -78,8 +78,9 @@ export class CheckApi extends Context.Service<
     // and no worker plans.
     // `main`: the commit of main the change is on (the push's base), so the fleet rebuilds warms
     // behind it (outrun 1.9.4).
-    // `os`: a macOS VM (a run's `runs-on: outrun-macos` job), else Linux.
-    readonly create: (repo: string, workers: number, run?: boolean, main?: string, os?: "macos") => Effect.Effect<Created, NotRun>;
+    // `os`: a macOS VM (a run's `runs-on: outrun-macos-26` job), else Linux.
+    // `exclude`: Minis not to place a worker on (a run's cell again after its worker failed there).
+    readonly create: (repo: string, workers: number, run?: boolean, main?: string, os?: "macos", exclude?: readonly string[]) => Effect.Effect<Created, NotRun>;
     // `patches`: HEAD's tree as a patch on each warm commit the workers start from (by sha);
     // `message`: the commit messages of the change (Repo `messageFrom`), the VM's commit's;
     // `change`: the push's base to HEAD (Repo `base`), absent when the clone has no remote main.
@@ -422,11 +423,20 @@ export const checkApiLive = (api: string, installation: string, token: string, g
       ),
     );
   return Layer.succeed(CheckApi, {
-    create: (repo, workers, run, main, os) =>
+    create: (repo, workers, run, main, os, exclude) =>
       request("", {
         method: "POST",
         // `bases`: this CLI sends a patch for each warm commit, so workers may start from several.
-        body: { protocol: CHECK_PROTOCOL, repo, workers, bases: true, ...(run ? { run: true } : {}), ...(main ? { main } : {}), ...(os ? { os } : {}) },
+        body: {
+          protocol: CHECK_PROTOCOL,
+          repo,
+          workers,
+          bases: true,
+          ...(run ? { run: true } : {}),
+          ...(main ? { main } : {}),
+          ...(os ? { os } : {}),
+          ...(exclude && exclude.length > 0 ? { exclude } : {}),
+        },
         ...(githubToken ? { headers: { "x-github-token": githubToken } } : {}),
       }).pipe(Effect.map((body) => body as unknown as Created)),
     patch: (id, sha, patches, message, change) =>

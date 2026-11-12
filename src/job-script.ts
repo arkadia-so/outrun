@@ -110,7 +110,7 @@ lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 state() { cat "$OUTRUN_RUN_DIR/steps/$1/$2" 2>/dev/null || true; }
 ms() { local t; t=$(date +%s%3N); [[ "$t" != *N ]] || t=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000' 2>/dev/null) || t=$(( $(date +%s) * 1000 )); echo "$t"; }
 # A step's timeout-minutes, replacing the step's shell: GNU timeout's exit 124, its process group
-# killed; macOS has no timeout (a job of runs-on: outrun-macos), so perl's alarm there.
+# killed; macOS has no timeout (a job of runs-on: outrun-macos-26), so perl's alarm there.
 steptimeout() {
   local s=$1; shift
   if command -v timeout >/dev/null 2>&1; then exec timeout --kill-after=10 "$s" "$@"; fi

@@ -72,9 +72,12 @@ does. It is not there yet.
    runs-on: ${{ fromJSON(vars.MACOS_RUNNER || '["macos-26"]') }}
    ```
 
-   `gh variable set CI_RUNNER --body outrun-linux-arm64` moves the jobs; `gh variable delete
-   CI_RUNNER` brings them back. Labels: `outrun` (Linux x64), `outrun-8cpu` (a whole x64 machine),
-   `outrun-linux-arm64`, `outrun-macos`.
+   `gh variable set CI_RUNNER --body outrun-ubuntu-24.04-arm` moves the jobs; `gh variable delete
+   CI_RUNNER` brings them back. Labels, named as GitHub's (the image's OS and version, `-arm` for
+   arm64, `-8` for 8 vCPU): `outrun-ubuntu-24.04` (Linux x64, 4 vCPU), `outrun-ubuntu-24.04-8` (a
+   whole x64 machine), `outrun-ubuntu-24.04-arm`, `outrun-macos-26`; `-priority` or `-flex` after
+   any of them picks a tier. The older `outrun`, `outrun-8cpu`, `outrun-linux-arm64` and
+   `outrun-macos` still work, as deprecated aliases of the same runners: move off them.
 3. Leave jobs on GitHub's runners when a GitHub feature needs them: publishing with trusted
    publishing (npm's OIDC), and store uploads whose credentials are bound to GitHub's runners.
 4. Before moving to arm64, check the arm64 gaps (section 4): SDKs without a Linux arm64 build, and

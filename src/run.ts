@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 // `outrun run <workflow>`: a GitHub Actions workflow run on outrun's VMs (Linux, or macOS for
-// `runs-on: outrun-macos`) against this tree, its
+// `runs-on: outrun-macos-26`) against this tree, its
 // verdict and its logs in the terminal (outrun/README.md "outrun run"). The tree: HEAD with the
 // working tree's changes, untracked files included (or exactly a commit, `--ref`), sent as a patch on
 // the warm commit of the Minis, so GitHub never sees it. Each job runs as GitHub runs it (needs,
@@ -12,7 +12,11 @@ import { spawnSync } from "node:child_process";
 //
 // Exit 0: every job passed (or was skipped by its if:). 1: one failed (its log printed). 2: refused
 // (the workflow uses what v1 does not run). 3: the fleet did not run it (unreachable, no warm
-// checkout yet, no VM free, a worker lost): the caller decides what to do, never a local run here.
+// checkout yet, no VM free, or a cell's workers lost REDISPATCHES + 1 times): the caller decides what
+// to do, never a local run here. A cell whose worker failed for the fleet's reason (`WorkerFailed`: its
+// VM lost, its agent reporting no job, no answer in time) runs again on another Mini, the failed one
+// named and left out for the rest of the run (Gabin, 2026-11-11: one Mini misbehaving failed the
+// presubmit while the other shards passed); a job whose steps fail is a verdict, never run again.
 // Needs what `outrun check` needs: OUTRUN_API_TOKEN, OUTRUN_INSTALLATION (or --installation),
 // OUTRUN_API, OUTRUN_GITHUB_TOKEN.
 import { existsSync, readFileSync } from "node:fs";
@@ -53,6 +57,28 @@ import {
 class RunRefused extends Schema.TaggedError<RunRefused>()("RunRefused", { message: Schema.String }) {}
 /** A job failed (exit 1); its log is printed already. */
 class RunFailed extends Schema.TaggedError<RunFailed>()("RunFailed", {}) {}
+/**
+ * One worker could not run a cell, for a reason of the fleet's and not of the job's: its VM lost or not
+ * up, its agent reporting no job, no answer in time. The cell may run on another Mini (`redispatch`);
+ * a job whose steps failed is a result (`Ran`), never this.
+ */
+export class WorkerFailed extends Schema.TaggedError<WorkerFailed>()("WorkerFailed", { mini: Schema.String, message: Schema.String }) {}
+
+// A cell's runs again on another worker after a WorkerFailed, at most (Gabin, 2026-11-11: "once or
+// twice"); past them the cell is not run (NotRun, exit 3).
+export const REDISPATCHES = 2;
+export type Redispatch = { readonly again: true; readonly exclude: readonly string[] } | { readonly again: false; readonly message: string };
+/**
+ * After a cell's workers failed (`failures`, in order) for the fleet's reason: run it again on a Mini
+ * none of them was on, nor any Mini that failed earlier in the run (`bad`), or give up naming each.
+ */
+export const redispatch = (cell: string, failures: readonly WorkerFailed[], bad: ReadonlySet<string>): Redispatch =>
+  failures.length <= REDISPATCHES
+    ? { again: true, exclude: [...new Set([...bad, ...failures.map((f) => f.mini)])].sort() }
+    : {
+        again: false,
+        message: `${cell}: no worker ran it, ${failures.length} tried: ${failures.map((f) => `${f.mini}: ${f.message}`).join("; ")}`,
+      };
 
 // The cells running at once, at most: a check's own bound (control-plane checks.ts MAX_WORKERS).
 const MAX_CELLS = 8;
@@ -312,6 +338,8 @@ export const fleet = (
   // The base's commit object, which the cell's checkout gets back (job-script.ts basePrelude).
   baseCommit: string | undefined,
   cells: Record<string, number>,
+  // Where the run says that a Mini failed one of its workers and the cell runs again elsewhere.
+  print: (line: string) => Effect.Effect<void> = (line) => Console.log(line),
 ) =>
   Effect.gen(function* () {
     const api = yield* CheckApi;
@@ -319,29 +347,38 @@ export const fleet = (
     const idle = new Set<string>();
     // Per OS: the VMs coming (starting or ready in `pool`) that no cell has claimed yet.
     const pools = {
-      linux: { coming: 0, pool: yield* Queue.unbounded<Exit.Exit<Ready, NotRun>>() },
-      macos: { coming: 0, pool: yield* Queue.unbounded<Exit.Exit<Ready, NotRun>>() },
+      linux: { coming: 0, pool: yield* Queue.unbounded<Exit.Exit<Ready, NotRun | WorkerFailed>>() },
+      macos: { coming: 0, pool: yield* Queue.unbounded<Exit.Exit<Ready, NotRun | WorkerFailed>>() },
     };
     // The VMs' starts belong to the run, not to the cell or job that asked for them.
     const starts = yield* Scoped.make();
     const learned: Record<string, number> = {};
+    // The Minis that failed a worker of this run: no later VM of the run is asked or taken there.
+    const bad = new Set<string>();
 
-    // A VM up and patched, or NotRun; a check created and then failed or interrupted is ended.
+    // A VM up and patched; WorkerFailed when its Mini did not bring it up, NotRun when the fleet gave
+    // none. A check created and then failed or interrupted is ended.
     const acquire = (os: Os) =>
       Effect.gen(function* () {
         const t0 = Date.now();
         // No VM free now: the run's other cells hold some, so this one waits its turn, within READY_MS.
         const check = yield* api
-          .create(repo, 1, true, base?.sha, os === "macos" ? "macos" : undefined)
+          .create(repo, 1, true, base?.sha, os === "macos" ? "macos" : undefined, [...bad].sort())
           .pipe(Effect.retry({ schedule: Schedule.spaced("3 seconds"), while: (e) => / 409 full\b/.test(e.message) && Date.now() - t0 < READY_MS }));
         return yield* Effect.gen(function* () {
           const worker = check.workers[0];
           if (!worker) return yield* new NotRun({ message: "the fleet gave no VM" });
           const sha = worker.sha ?? check.sha;
-          yield* api.patch(check.id, check.sha, { [sha]: yield* patchOf(sha) }, yield* message(base?.sha ?? sha), base?.change);
-          const ready = yield* waitFor(check.id, 0, (events) => events.some((e) => e.step === "apply"), t0 + READY_MS, t0);
-          const broken = ready.events.find((e) => e.code !== 0);
-          if (broken) return yield* new NotRun({ message: `${broken.worker} ${broken.step}: exit ${broken.code}: ${broken.log.slice(-500)}` });
+          const patches = { [sha]: yield* patchOf(sha) };
+          const text = yield* message(base?.sha ?? sha);
+          // From here a failure is the worker's: its Mini did not take the patch, or its VM did not come up.
+          const ready = yield* Effect.gen(function* () {
+            yield* api.patch(check.id, check.sha, patches, text, base?.change);
+            const ready = yield* waitFor(check.id, 0, (events) => events.some((e) => e.step === "apply"), t0 + READY_MS, t0);
+            const broken = ready.events.find((e) => e.code !== 0);
+            if (broken) return yield* new NotRun({ message: `${broken.worker} ${broken.step}: exit ${broken.code}: ${broken.log.slice(-500)}` });
+            return ready;
+          }).pipe(Effect.mapError((e) => new WorkerFailed({ mini: worker.mini, message: e.message })));
           idle.add(check.id);
           return { id: check.id, os, mini: worker.mini, sha, after: ready.after, at: Date.now() } satisfies Ready;
         }).pipe(Effect.onError(() => api.end(check.id)));
@@ -365,42 +402,53 @@ export const fleet = (
     };
 
     // The first VM ready, one started for it when none is coming unclaimed. One older than
-    // AHEAD_FRESH_MS is ended and the next taken; one that failed to start, another started for it.
-    const vm = (os: Os): Effect.Effect<Ready, NotRun, CheckApi> =>
+    // AHEAD_FRESH_MS, or on a Mini that failed the run since, is ended and the next taken; one that
+    // failed to start, another started for it (its Mini, when it failed there, left out of the run).
+    const vm = (os: Os): Effect.Effect<Ready, NotRun | WorkerFailed, CheckApi> =>
       Effect.gen(function* () {
         if (pools[os].coming === 0) yield* start(os);
         pools[os].coming--;
         const exit = yield* Queue.take(pools[os].pool);
-        if (Exit.isFailure(exit)) return yield* acquire(os).pipe(Effect.tap((ready) => Effect.sync(() => idle.delete(ready.id))));
+        if (Exit.isFailure(exit)) {
+          const error = Exit.findErrorOption(exit);
+          if (error._tag === "Some" && error.value._tag === "WorkerFailed") {
+            bad.add(error.value.mini);
+            yield* print(`- ${error.value.mini} did not bring a VM of the run up (${error.value.message.slice(0, 300)}): left out of this run`);
+          }
+          return yield* acquire(os).pipe(Effect.tap((ready) => Effect.sync(() => idle.delete(ready.id))));
+        }
         idle.delete(exit.value.id);
-        if (Date.now() - exit.value.at < AHEAD_FRESH_MS) return exit.value;
+        if (!bad.has(exit.value.mini) && Date.now() - exit.value.at < AHEAD_FRESH_MS) return exit.value;
         yield* api.end(exit.value.id);
         return yield* vm(os);
       });
 
-    const runCell: RunCell<CheckApi> = (cell) =>
+    // One attempt of a cell (its `attempt`th, GITHUB_RUN_ATTEMPT in its steps) on one worker: the job's
+    // result, whatever its verdict; WorkerFailed when that worker gave none.
+    const once = (cell: Cell, attempt: number, t0: number) =>
       Effect.gen(function* () {
-        const t0 = Date.now();
-        const got = yield* vm(cell.os).pipe(Effect.mapError((e) => new NotRun({ message: `${cell.name}: ${e.message}` })));
+        const got = yield* vm(cell.os).pipe(Effect.catchTag("NotRun", (e) => Effect.fail(new NotRun({ message: `${cell.name}: ${e.message}` }))));
         return yield* Effect.gen(function* () {
           yield* api.shards(got.id, [
             {
               worker: 0,
               tasks: [cell.id],
-              script: base && baseCommit ? basePrelude(base.sha, baseCommit) + cell.script : cell.script,
+              script: `export GITHUB_RUN_ATTEMPT=${attempt}\n${base && baseCommit ? basePrelude(base.sha, baseCommit) : ""}${cell.script}`,
               timeoutMs: cell.timeoutMs,
             },
           ]);
           const sent = Date.now();
+          // The job's own timeout-minutes is enforced in its VM (a failure, its log kept): past it and
+          // RESULT_SLACK_MS with no result, the worker is gone.
           const ran = yield* waitFor(got.id, got.after, (events) => events.some((e) => e.step === "shard"), sent + cell.timeoutMs + RESULT_SLACK_MS, sent);
           const shard = ran.events.find((e) => e.step === "shard")!;
           const job = (shard.json.job ?? null) as { outputs?: Record<string, unknown>; steps?: StepLine[] } | null;
-          // A shard that ran no job script (an agent before `outrun run`) is not a verdict.
           // A shard that ran no job script (an agent before `outrun run`), or whose result was lost, is
           // not a verdict: what the agent did report is said, never guessed.
           if (!job && shard.code === 0)
-            return yield* new NotRun({
-              message: `${cell.name}: ${got.mini}'s agent reported no job result (exit 0, ${shard.ms} ms; reported ${JSON.stringify(Object.keys(shard.json))}); its log ends: ${shard.log.slice(-600)}`,
+            return yield* new WorkerFailed({
+              mini: got.mini,
+              message: `its agent reported no job result (exit 0, ${shard.ms} ms; reported ${JSON.stringify(Object.keys(shard.json))}); its log ends: ${shard.log.slice(-600)}`,
             });
           return {
             result: shard.code === 0 ? ("success" as const) : ("failure" as const),
@@ -410,9 +458,34 @@ export const fleet = (
             ms: Date.now() - t0,
             where: `${got.mini}${got.os === "macos" ? " (macOS)" : ""}, main at ${got.sha.slice(0, 8)}`,
             ...(isLoad(shard.json.host) ? { host: shard.json.host } : {}),
-          };
-        }).pipe(Effect.ensuring(api.end(got.id)));
+          } satisfies Ran;
+        }).pipe(
+          Effect.catchTag("NotRun", (e) => Effect.fail(new WorkerFailed({ mini: got.mini, message: e.message }))),
+          Effect.ensuring(api.end(got.id)),
+        );
       });
+
+    // A cell on the fleet: again on another Mini after its worker failed (`redispatch`), never after
+    // its job failed.
+    const runCell: RunCell<CheckApi> = (cell) => {
+      const t0 = Date.now();
+      const from = (failures: readonly WorkerFailed[]): Effect.Effect<Ran, NotRun, CheckApi> =>
+        once(cell, failures.length + 1, t0).pipe(
+          Effect.catchTag("WorkerFailed", (failure) =>
+            Effect.gen(function* () {
+              bad.add(failure.mini);
+              const tried = [...failures, failure];
+              const next = redispatch(cell.name, tried, bad);
+              if (!next.again) return yield* new NotRun({ message: next.message });
+              yield* print(
+                `- ${cell.name}: ${failure.mini} did not run it (${failure.message.slice(0, 300)}); again on another worker, not on ${next.exclude.join(", ")} (attempt ${tried.length + 1} of ${REDISPATCHES + 1})`,
+              );
+              return yield* from(tried);
+            }),
+          ),
+        );
+      return from([]);
+    };
 
     // The VMs nobody used, ended; the cells' counts the jobs ran, for the next run.
     const close = Effect.gen(function* () {
@@ -576,6 +649,6 @@ const handler = ({
 
 export const runCommand = Command.make("run", flags, handler).pipe(
   Command.withDescription(
-    "a GitHub Actions workflow on outrun's VMs (Linux, macOS for runs-on outrun-macos) against this tree (exit 0 passed, 1 failed, 2 refused, 3 not run)",
+    "a GitHub Actions workflow on outrun's VMs (Linux, macOS for runs-on outrun-macos-26) against this tree (exit 0 passed, 1 failed, 2 refused, 3 not run)",
   ),
 );

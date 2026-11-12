@@ -12,7 +12,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { CheckApi, type CheckEvent, NotRun } from "./check.ts";
 import { condition, evaluate, interpolate, parse } from "./expr.ts";
 import { basePrelude } from "./job-script.ts";
-import { type Cell, fleet, prepare, type Ran, runWorkflow } from "./run.ts";
+import { type Cell, fleet, prepare, type Ran, redispatch, REDISPATCHES, runWorkflow, WorkerFailed } from "./run.ts";
 import { expandMatrix, parseWorkflow } from "./workflow.ts";
 
 const dirs: string[] = [];
@@ -144,7 +144,7 @@ describe("a job's output ends with its last step", () => {
   });
 });
 
-describe("a job with runs-on: outrun-macos runs on a macOS VM, as an ordinary GitHub Actions job", () => {
+describe("a job with runs-on: outrun-macos-26 runs on a macOS VM, as an ordinary GitHub Actions job", () => {
   it("gives its cell the macOS OS, RUNNER_OS and runner.os, and its Linux neighbours Linux", async () => {
     const yaml = `on: workflow_dispatch
 jobs:
@@ -152,15 +152,21 @@ jobs:
     runs-on: outrun-macos
     steps:
       - run: echo "os=$RUNNER_OS \${{ runner.os }} $RUNNER_ARCH"
+  mac26:
+    runs-on: outrun-macos-26-flex
+    steps:
+      - run: echo "os=$RUNNER_OS"
   linux:
     runs-on: [self-hosted, outrun]
     steps:
       - run: echo "os=$RUNNER_OS \${{ runner.os }}"
 `;
     const { cells, results } = await run(yaml);
-    expect(results).toEqual({ mac: "success", linux: "success" });
+    expect(results).toEqual({ mac: "success", mac26: "success", linux: "success" });
     const byJob = Object.fromEntries(cells.map((cell) => [cell.job, cell]));
     expect(byJob.mac!.os).toBe("macos");
+    // The new name and its deprecated alias (labels.ts ALIASES) are the same runner.
+    expect(byJob.mac26!.os).toBe("macos");
     expect(byJob.mac!.script).toContain("export RUNNER_OS='macOS'");
     expect(byJob.mac!.script).toContain(`echo "os=$RUNNER_OS ''macOS'' $RUNNER_ARCH"`);
     expect(byJob.linux!.os).toBe("linux");
@@ -201,7 +207,7 @@ jobs:
       - run: true
 `;
     const { exit } = await run(yaml);
-    expect(refusal(exit)).toContain("runs-on macos-15: outrun run runs Linux jobs and outrun-macos ones only");
+    expect(refusal(exit)).toContain("runs-on macos-15: outrun run runs Linux jobs and outrun-macos-26 ones only");
     const lfs = await run(
       `on: workflow_dispatch\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v5\n        with:\n          lfs: true\n      - run: true\n`,
     );
@@ -505,9 +511,13 @@ describe("the run's checkout on a VM", () => {
 
 // The fleet behind `outrun run` (run.ts `fleet`), on a fake control plane: each check one VM, its
 // apply at once, its shard answered with the job's report.
-// `slow`: a check whose VM comes up late.
-const fakeFleet = (slow?: string) => {
+// `slow`: a check whose VM comes up late. `minis`: where a check goes, the first not excluded by its
+// create (none left: no VM); `faults`: what a Mini does to a shard, its VM lost under it, its
+// agent reporting no job, or its job failing as a job does.
+const fakeFleet = (slow?: string, { minis = ["mm1"], faults = {} }: { minis?: string[]; faults?: Record<string, "lost" | "no-job" | "fail"> } = {}) => {
   const calls: string[] = [];
+  const scripts: string[] = [];
+  const on = new Map<string, string>();
   const events = new Map<string, CheckEvent[]>();
   let next = 0;
   const push = (id: string, event: Omit<CheckEvent, "seq" | "ms" | "log" | "worker">) => {
@@ -516,12 +526,16 @@ const fakeFleet = (slow?: string) => {
     events.set(id, list);
   };
   const layer = Layer.succeed(CheckApi, {
-    create: (_repo, _workers, _run, _main, os) =>
+    create: (_repo, _workers, _run, _main, os, exclude = []) =>
       Effect.sync(() => {
         const id = `c${++next}`;
-        calls.push(`create ${id}${os ? ` ${os}` : ""}`);
+        calls.push(`create ${id}${os ? ` ${os}` : ""}${exclude.length ? ` not ${exclude.join(",")}` : ""}`);
+        const free = minis.filter((m) => !exclude.includes(m));
+        if (free.length === 0) return { id, sha: "a".repeat(40), workers: [] };
+        const mini = free[0]!;
+        on.set(id, mini);
         push(id, { step: "up", code: 0, json: {} });
-        return { id, sha: "a".repeat(40), workers: [{ name: `w-${id}`, mini: "mm1" }] };
+        return { id, sha: "a".repeat(40), workers: [{ name: `w-${id}`, mini }] };
       }),
     patch: (id) =>
       Effect.sleep(id === slow ? "40 millis" : "1 millis").pipe(Effect.andThen(Effect.sync(() => void push(id, { step: "apply", code: 0, json: {} })))),
@@ -529,22 +543,28 @@ const fakeFleet = (slow?: string) => {
     shards: (id, shards) =>
       Effect.sync(() => {
         const name = shards[0]!.tasks[0]!;
-        calls.push(`run ${name} on ${id}`);
+        calls.push(`run ${name} on ${id}${minis.length > 1 ? ` (${on.get(id)})` : ""}`);
+        scripts.push(shards[0]!.script ?? "");
         return name;
       }).pipe(
         Effect.tap((name) =>
           Effect.sleep("20 millis").pipe(
             Effect.andThen(
-              Effect.sync(() =>
+              Effect.sync(() => {
+                const fault = faults[on.get(id)!];
+                if (fault === "lost") return push(id, { step: "lost", code: 0, json: {} });
                 push(id, {
                   step: "shard",
-                  code: 0,
-                  json: {
-                    job: { outputs: name.endsWith(":plan") ? { shards: "[1,2]" } : {}, steps: [] },
-                    host: { cpu: 634, cpuPeak: 981, memMb: 20582, memTotalMb: 32768, cpus: 12 },
-                  },
-                }),
-              ),
+                  code: fault === "fail" ? 1 : 0,
+                  json:
+                    fault === "no-job"
+                      ? {}
+                      : {
+                          job: { outputs: name.endsWith(":plan") ? { shards: "[1,2]" } : {}, steps: [] },
+                          host: { cpu: 634, cpuPeak: 981, memMb: 20582, memTotalMb: 32768, cpus: 12 },
+                        },
+                });
+              }),
             ),
           ),
         ),
@@ -557,8 +577,87 @@ const fakeFleet = (slow?: string) => {
       }),
     end: (id) => Effect.sync(() => void calls.push(`end ${id}`)),
   });
-  return { calls, layer };
+  return { calls, scripts, layer };
 };
+
+describe("a cell whose worker failed for the fleet's reason runs again on another Mini; a failed job never does", () => {
+  const failure = (mini: string) => new WorkerFailed({ mini, message: `${mini} lost` });
+
+  it("decides: again, leaving out every Mini that failed the run, up to REDISPATCHES times, then gives up naming each", () => {
+    expect(REDISPATCHES).toBe(2);
+    expect(redispatch("shard 1/4", [failure("mm11")], new Set(["mm11", "mm3"]))).toEqual({ again: true, exclude: ["mm11", "mm3"] });
+    expect(redispatch("shard 1/4", [failure("mm11"), failure("mm6")], new Set())).toEqual({ again: true, exclude: ["mm11", "mm6"] });
+    expect(redispatch("shard 1/4", [failure("mm11"), failure("mm6"), failure("mm8")], new Set())).toEqual({
+      again: false,
+      message: "shard 1/4: no worker ran it, 3 tried: mm11: mm11 lost; mm6: mm6 lost; mm8: mm8 lost",
+    });
+  });
+
+  const yaml = "on: workflow_dispatch\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n";
+  const runOne = (options: Parameters<typeof fakeFleet>[1]) => {
+    const fake = fakeFleet(undefined, options);
+    const lines: string[] = [];
+    return Effect.runPromiseExit(
+      Effect.gen(function* () {
+        const { workflow, jobs, inputs } = yield* prepare("w.yml", yaml, [], [], "acme/app");
+        const print = (line: string) => Effect.sync(() => void lines.push(line));
+        const f = yield* fleet(
+          "acme/app",
+          () => Effect.succeed("patch"),
+          () => Effect.succeed("m"),
+          undefined,
+          undefined,
+          {},
+          print,
+        );
+        const results = yield* runWorkflow(workflow, jobs, { repository: "acme/app", ref: "refs/heads/main", inputs }, f.runCell, print);
+        yield* f.close;
+        return Object.fromEntries(results);
+      }).pipe(Effect.provide(fake.layer)),
+    ).then((exit) => ({ exit, lines, log: lines.join("\n"), ...fake }));
+  };
+
+  it("runs a cell whose VM was lost again on another Mini, names the lost one, and asks the fleet to leave it out", async () => {
+    const { exit, log, calls, scripts } = await runOne({ minis: ["mm11", "mm6"], faults: { mm11: "lost" } });
+    expect(Exit.isSuccess(exit) && exit.value).toEqual({ a: "success" });
+    expect(log).toContain("- a: mm11 did not run it (worker w-c1 was lost: ); again on another worker, not on mm11 (attempt 2 of 3)");
+    expect(log).toMatch(/✓ a · [\d.]+ s on mm6,/);
+    expect(calls).toEqual(["create c1", "run w.yml:a on c1 (mm11)", "end c1", "create c2 not mm11", "run w.yml:a on c2 (mm6)", "end c2"]);
+    // Each attempt's steps see it, as GitHub's re-run's.
+    expect(scripts.map((s) => s.split("\n")[0])).toEqual(["export GITHUB_RUN_ATTEMPT=1", "export GITHUB_RUN_ATTEMPT=2"]);
+  });
+
+  it("runs a cell whose agent reported no job again elsewhere (mm11, 2026-11-11)", async () => {
+    const { exit, log } = await runOne({ minis: ["mm11", "mm6"], faults: { mm11: "no-job" } });
+    expect(Exit.isSuccess(exit) && exit.value).toEqual({ a: "success" });
+    expect(log).toContain("- a: mm11 did not run it (its agent reported no job result");
+    expect(log).toMatch(/✓ a · [\d.]+ s on mm6,/);
+  });
+
+  it("never runs again a job whose steps failed: that is a verdict", async () => {
+    const { exit, calls } = await runOne({ minis: ["mm11", "mm6"], faults: { mm11: "fail" } });
+    expect(Exit.isSuccess(exit) && exit.value).toEqual({ a: "failure" });
+    expect(calls.filter((c) => c.startsWith("run "))).toEqual(["run w.yml:a on c1 (mm11)"]);
+  });
+
+  it("gives up, not run (exit 3), once REDISPATCHES + 1 workers failed it, naming each Mini", async () => {
+    const { exit, calls } = await runOne({ minis: ["mm11", "mm6", "mm8", "mm9"], faults: { mm11: "lost", mm6: "lost", mm8: "no-job" } });
+    expect(Exit.isFailure(exit)).toBe(true);
+    const error = Exit.isFailure(exit) ? (exit.cause.reasons.find((r) => r._tag === "Fail") as { error: { _tag: string; message: string } }).error : null;
+    expect(error?._tag).toBe("NotRun");
+    expect(error?.message).toMatch(
+      /^a: no worker ran it, 3 tried: mm11: worker w-c1 was lost: ; mm6: worker w-c2 was lost: ; mm8: its agent reported no job result/,
+    );
+    expect(calls.filter((c) => c.startsWith("create"))).toEqual(["create c1", "create c2 not mm11", "create c3 not mm11,mm6"]);
+  });
+
+  it("is not run when the fleet itself gives no VM: no Mini failed, none to leave out", async () => {
+    const { exit, calls, log } = await runOne({ minis: [] });
+    expect(Exit.isFailure(exit)).toBe(true);
+    expect(calls.filter((c) => c.startsWith("create")).every((c) => !c.includes(" not "))).toBe(true);
+    expect(log).not.toContain("did not run it");
+  });
+});
 
 describe("the host's load during a job is in the run's report, beside its VM's", () => {
   it("prints on the job's line the whole host's CPU (mean and peak of its cores) and its peak memory", async () => {
