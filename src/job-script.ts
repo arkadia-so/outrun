@@ -298,15 +298,18 @@ export const compileJob = (workflow: Workflow, job: Job, scope: Scope, env: Read
       "fi",
     );
   });
-  // The job's outputs, then the result the worker sends back.
+  // The job's outputs, then the result the worker sends back. An output's value reaches jq through a
+  // file, never as an argument: one argument of a command holds 128 KB at most on Linux, so a larger
+  // output ended the program with no result ("jq: Argument list too long", 2026-11-15). printf is
+  // bash's own, with no such limit.
   const outputs = isObject(job.raw.outputs) ? Object.entries(job.raw.outputs) : [];
   lines.push(
-    'outputs="{}"',
-    ...outputs.map(
-      ([key, value]) =>
-        `outputs=$(jq -c --arg k ${q(key)} --arg v ${word(typeof value === "string" ? value : toText(value as Value), staticScope)} '. + {($k): $v}' <<<"$outputs")`,
-    ),
-    `jq -n -c --arg cpus "\${OUTRUN_CPUS:-0}" --argjson outputs "$outputs" --rawfile steps "$OUTRUN_RUN_DIR/steps.tsv" '{outputs: $outputs, steps: ($steps | split("\\n") | map(select(length > 0) | split("\\t") | {name: .[0], outcome: .[1], conclusion: .[2], ms: (.[3] | tonumber)} + ((.[4] // "") | split(" ") | if length == 4 then {load: {cpu: (.[0] | tonumber), cpuPeak: (.[1] | tonumber), memMb: (.[2] | tonumber), memTotalMb: (.[3] | tonumber), cpus: ($cpus | tonumber)}} else {} end)))}' > "\${OUTRUN_RUN_RESULT:-/dev/null}"`,
+    `printf '{}' > "$OUTRUN_RUN_DIR/outputs.json"`,
+    ...outputs.flatMap(([key, value]) => [
+      `printf '%s' ${word(typeof value === "string" ? value : toText(value as Value), staticScope)} > "$OUTRUN_RUN_DIR/output.value"`,
+      `jq -c --arg k ${q(key)} --rawfile v "$OUTRUN_RUN_DIR/output.value" '. + {($k): $v}' "$OUTRUN_RUN_DIR/outputs.json" > "$OUTRUN_RUN_DIR/outputs.next"; mv "$OUTRUN_RUN_DIR/outputs.next" "$OUTRUN_RUN_DIR/outputs.json"`,
+    ]),
+    `jq -c --arg cpus "\${OUTRUN_CPUS:-0}" --rawfile steps "$OUTRUN_RUN_DIR/steps.tsv" '{outputs: ., steps: ($steps | split("\\n") | map(select(length > 0) | split("\\t") | {name: .[0], outcome: .[1], conclusion: .[2], ms: (.[3] | tonumber)} + ((.[4] // "") | split(" ") | if length == 4 then {load: {cpu: (.[0] | tonumber), cpuPeak: (.[1] | tonumber), memMb: (.[2] | tonumber), memTotalMb: (.[3] | tonumber), cpus: ($cpus | tonumber)}} else {} end)))}' "$OUTRUN_RUN_DIR/outputs.json" > "\${OUTRUN_RUN_RESULT:-/dev/null}"`,
     '[ "$status" = success ]',
   );
   return {

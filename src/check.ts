@@ -199,6 +199,19 @@ export const waitFor = (id: string, from: number, done: (events: readonly CheckE
     return { events: seen, after };
   });
 
+// A step's events, one per worker (its first): how many workers ended the step, and each one's result.
+// Never the events' count: a result delivered twice (its Mini posts a batch again when the answer to
+// its post was lost; a control plane before 2026-11-15 kept both) is one worker's, and counted as two
+// it passed a check while another worker's shard still ran.
+export const stepEvents = (events: readonly CheckEvent[], step: CheckEvent["step"]) => {
+  const workers = new Set<string>();
+  return events.filter((e) => {
+    if (e.step !== step || workers.has(e.worker)) return false;
+    workers.add(e.worker);
+    return true;
+  });
+};
+
 // The units (or groups) whose expected time alone is over `targetMs`: no split makes the check
 // shorter than they are, so they are named for their owner to split.
 export const overTarget = (units: readonly Unit[], targetMs: number) => {
@@ -238,7 +251,7 @@ export const runRepoCheck = (workers: number, targetMs = 30_000, { slackMs = CHE
       // every commit landed since as the push's (outrun 1.8). The VM commits the base, then the change.
       yield* api.patch(check.id, check.sha, patches, yield* repo.messageFrom(base?.sha ?? check.sha), base?.change);
       // Every worker up and patched; the first's apply carries the plan.
-      const ready = yield* waitFor(check.id, 0, (events) => events.filter((e) => e.step === "apply").length === n, Math.min(cap, t0 + READY_MS), t0);
+      const ready = yield* waitFor(check.id, 0, (events) => stepEvents(events, "apply").length === n, Math.min(cap, t0 + READY_MS), t0);
       const failed = ready.events.find((e) => e.code !== 0);
       if (failed) return yield* new NotRun({ message: `${failed.worker} ${failed.step}: exit ${failed.code}: ${failed.log.slice(-500)}` });
       const readyAt = Date.now();
@@ -270,11 +283,11 @@ export const runRepoCheck = (workers: number, targetMs = 30_000, { slackMs = CHE
       const ran = yield* waitFor(
         check.id,
         ready.after,
-        (events) => events.filter((e) => e.step === "shard").length === shards.length,
+        (events) => stepEvents(events, "shard").length === shards.length,
         Math.min(cap, sentAt + expectedMs + slackMs),
         sentAt,
       );
-      const results = ran.events.filter((e) => e.step === "shard");
+      const results = stepEvents(ran.events, "shard");
       const all = results.flatMap(shardTasks);
       const red = all.filter((t) => t.exit !== 0 && t.exit !== null);
       const slowest = [...all].sort((a, b) => b.ms - a.ms).slice(0, 3);

@@ -2,7 +2,7 @@
 // (job-script.ts) run here in bash, in a scratch directory standing for the worker's checkout, so
 // what these tests prove is the program's behaviour, not a fake of it.
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as Effect from "effect/Effect";
@@ -12,7 +12,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { CheckApi, type CheckEvent, NotRun } from "./check.ts";
 import { condition, evaluate, interpolate, parse } from "./expr.ts";
 import { basePrelude } from "./job-script.ts";
-import { type Cell, fleet, prepare, type Ran, redispatch, REDISPATCHES, runWorkflow, WorkerFailed } from "./run.ts";
+import { type Cell, fleet, prepare, type Ran, redispatch, REDISPATCHES, runWorkflow, shardOutcome, WorkerFailed } from "./run.ts";
 import { expandMatrix, parseWorkflow } from "./workflow.ts";
 
 const dirs: string[] = [];
@@ -333,6 +333,40 @@ jobs:
     expect(log).toContain("l1+l2+");
     expect(log).toContain("tool-ran");
   });
+  // One argument of a command holds 128 KB at most on Linux (MAX_ARG_STRLEN), whatever the machine: a
+  // job's outputs reach its result through files, so these fail on Linux when one is passed to jq as an
+  // argument (2026-11-15: "jq: Argument list too long", no result, the job "not run" on three Minis).
+  it.each([200_000, 600_000])(
+    "writes a job's outputs of %i characters to its result, beside a small one",
+    async (size) => {
+      const yaml = `on: workflow_dispatch
+jobs:
+  big:
+    runs-on: ubuntu-latest
+    outputs:
+      blob: \${{ steps.blob.outputs.blob }}
+      small: s-\${{ steps.blob.outputs.small }}
+    steps:
+      - id: blob
+        run: |
+          echo "blob=$(head -c ${size} /dev/zero | tr '\\0' x)" >> "$GITHUB_OUTPUT"
+          echo "small=a 'b' \\"c\\"" >> "$GITHUB_OUTPUT"
+`;
+      const { cells } = await run(yaml);
+      const dir = mkdtempSync(join(tmpdir(), "outrun-run-"));
+      dirs.push(dir);
+      spawnSync("bash", ["-c", "git init -q && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m init"], { cwd: dir });
+      const result = join(dir, ".result.json");
+      const done = spawnSync("bash", ["-s"], { cwd: dir, input: cells[0]!.script, encoding: "utf8", env: { ...process.env, OUTRUN_RUN_RESULT: result } });
+      expect(`${done.status} ${done.stderr}`).toBe("0 ");
+      const job = JSON.parse(readFileSync(result, "utf8")) as { outputs: Record<string, string>; steps: { conclusion: string }[] };
+      expect(Object.keys(job.outputs)).toEqual(["blob", "small"]);
+      expect(job.outputs.blob).toBe("x".repeat(size));
+      expect(job.outputs.small).toBe(`s-a 'b' "c"`);
+      expect(job.steps.map((s) => s.conclusion)).toEqual(["success"]);
+    },
+    30_000,
+  );
   it("decides a step's if: on steps and env as the job runs, comparing strings without case", async () => {
     const yaml = `on: workflow_dispatch
 jobs:
@@ -513,8 +547,10 @@ describe("the run's checkout on a VM", () => {
 // apply at once, its shard answered with the job's report.
 // `slow`: a check whose VM comes up late. `minis`: where a check goes, the first not excluded by its
 // create (none left: no VM); `faults`: what a Mini does to a shard, its VM lost under it, its
-// agent reporting no job, or its job failing as a job does.
-const fakeFleet = (slow?: string, { minis = ["mm1"], faults = {} }: { minis?: string[]; faults?: Record<string, "lost" | "no-job" | "fail"> } = {}) => {
+// agent reporting no job, its job's program killed before it wrote its result (exit 137, no job) or
+// stopped at its timeout-minutes (exit 124, no job), or its job failing as a job does.
+type Fault = "lost" | "no-job" | "killed" | "timed-out" | "fail";
+const fakeFleet = (slow?: string, { minis = ["mm1"], faults = {} }: { minis?: string[]; faults?: Record<string, Fault> } = {}) => {
   const calls: string[] = [];
   const scripts: string[] = [];
   const on = new Map<string, string>();
@@ -555,9 +591,9 @@ const fakeFleet = (slow?: string, { minis = ["mm1"], faults = {} }: { minis?: st
                 if (fault === "lost") return push(id, { step: "lost", code: 0, json: {} });
                 push(id, {
                   step: "shard",
-                  code: fault === "fail" ? 1 : 0,
+                  code: fault === "fail" ? 1 : fault === "killed" ? 137 : fault === "timed-out" ? 124 : 0,
                   json:
-                    fault === "no-job"
+                    fault === "no-job" || fault === "killed" || fault === "timed-out"
                       ? {}
                       : {
                           job: { outputs: name.endsWith(":plan") ? { shards: "[1,2]" } : {}, steps: [] },
@@ -630,8 +666,45 @@ describe("a cell whose worker failed for the fleet's reason runs again on anothe
   it("runs a cell whose agent reported no job again elsewhere (mm11, 2026-11-11)", async () => {
     const { exit, log } = await runOne({ minis: ["mm11", "mm6"], faults: { mm11: "no-job" } });
     expect(Exit.isSuccess(exit) && exit.value).toEqual({ a: "success" });
-    expect(log).toContain("- a: mm11 did not run it (its agent reported no job result");
+    expect(log).toContain("- a: mm11 did not run it (its job ended with no result (exit 0,");
     expect(log).toMatch(/✓ a · [\d.]+ s on mm6,/);
+  });
+
+  // The job's program writes its result only at its end (job-script.ts): killed before (SIGKILL, its VM
+  // out of memory or disk: exit 137, no job), it said nothing of the change. A red check (exit 1)
+  // until 2026-11-15, never tried on another worker.
+  it("runs a cell whose program was killed before it wrote its result again elsewhere: no result is no verdict", async () => {
+    const { exit, log, calls } = await runOne({ minis: ["mm11", "mm6"], faults: { mm11: "killed" } });
+    expect(calls.filter((c) => c.startsWith("run "))).toEqual(["run w.yml:a on c1 (mm11)", "run w.yml:a on c2 (mm6)"]);
+    expect(Exit.isSuccess(exit) && exit.value).toEqual({ a: "success" });
+    expect(log).toContain("- a: mm11 did not run it (its job ended with no result (exit 137");
+  });
+
+  it("is not run (exit 3), never failed, when every worker's program was killed before its result", async () => {
+    const { exit } = await runOne({ minis: ["mm11", "mm6", "mm8", "mm9"], faults: { mm11: "killed", mm6: "killed", mm8: "killed" } });
+    const error = Exit.isFailure(exit) ? (exit.cause.reasons.find((r) => r._tag === "Fail") as { error: { _tag: string; message: string } }).error : null;
+    expect(error?._tag).toBe("NotRun");
+    expect(error?.message).toMatch(/^a: no worker ran it, 3 tried: mm11: its job ended with no result \(exit 137/);
+  });
+
+  it("never runs again a job stopped at its timeout-minutes: that is a verdict, as GitHub's cancel", async () => {
+    const { exit, calls } = await runOne({ minis: ["mm11", "mm6"], faults: { mm11: "timed-out" } });
+    expect(Exit.isSuccess(exit) && exit.value).toEqual({ a: "failure" });
+    expect(calls.filter((c) => c.startsWith("run "))).toEqual(["run w.yml:a on c1 (mm11)"]);
+  });
+
+  it("reads a shard's end as a verdict only with its job's result, or at its timeout", () => {
+    const job = { outputs: { n: 1 }, steps: [] };
+    expect(shardOutcome({ code: 0, json: { job } })).toEqual({ _tag: "Verdict", result: "success", job });
+    expect(shardOutcome({ code: 7, json: { job } })).toEqual({ _tag: "Verdict", result: "failure", job });
+    // A job that itself ended 124 or 137 after writing its result is that job's failure.
+    expect(shardOutcome({ code: 137, json: { job } })).toMatchObject({ _tag: "Verdict", result: "failure" });
+    expect(shardOutcome({ code: 124, json: {} })).toEqual({ _tag: "TimedOut" });
+    for (const code of [0, 1, 2, 125, 127, 137, 143]) {
+      expect(shardOutcome({ code, json: {} })).toEqual({ _tag: "NoResult", code });
+      expect(shardOutcome({ code, json: { job: null } })).toEqual({ _tag: "NoResult", code });
+      expect(shardOutcome({ code, json: { job: "not an object" } })).toEqual({ _tag: "NoResult", code });
+    }
   });
 
   it("never runs again a job whose steps failed: that is a verdict", async () => {
@@ -646,7 +719,7 @@ describe("a cell whose worker failed for the fleet's reason runs again on anothe
     const error = Exit.isFailure(exit) ? (exit.cause.reasons.find((r) => r._tag === "Fail") as { error: { _tag: string; message: string } }).error : null;
     expect(error?._tag).toBe("NotRun");
     expect(error?.message).toMatch(
-      /^a: no worker ran it, 3 tried: mm11: worker w-c1 was lost: ; mm6: worker w-c2 was lost: ; mm8: its agent reported no job result/,
+      /^a: no worker ran it, 3 tried: mm11: worker w-c1 was lost: ; mm6: worker w-c2 was lost: ; mm8: its job ended with no result \(exit 0,/,
     );
     expect(calls.filter((c) => c.startsWith("create"))).toEqual(["create c1", "create c2 not mm11", "create c3 not mm11,mm6"]);
   });

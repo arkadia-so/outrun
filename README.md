@@ -347,7 +347,8 @@ OUTRUN_API_TOKEN=ort_... OUTRUN_INSTALLATION=<id> OUTRUN_GITHUB_TOKEN=<a token t
   time (learned per repository, workflow and job in `~/.cache/outrun/run-cells.json`; nothing to
   configure), so a planner's shards start on VMs already up with your tree.
 - Exit 0: every job passed (or was skipped by its `if:`); 1: a job failed; 2: refused; 3: outrun did
-  not run it (unreachable, no warm checkout yet, no VM free, a worker lost): run it locally instead.
+  not run it (unreachable, no warm checkout yet, no VM free, or a job's worker lost or its program
+  killed before its end on three machines in a row): run it locally instead.
   The repository must be listed in the installation's check settings.
 
 ## outrun check: the fast CI on outrun's VMs

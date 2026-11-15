@@ -14,7 +14,7 @@ import { spawnSync } from "node:child_process";
 // (the workflow uses what v1 does not run). 3: the fleet did not run it (unreachable, no warm
 // checkout yet, no VM free, or a cell's workers lost REDISPATCHES + 1 times): the caller decides what
 // to do, never a local run here. A cell whose worker failed for the fleet's reason (`WorkerFailed`: its
-// VM lost, its agent reporting no job, no answer in time) runs again on another Mini, the failed one
+// VM lost, its job ended with no result, no answer in time) runs again on another Mini, the failed one
 // named and left out for the rest of the run (Gabin, 2026-11-11: one Mini misbehaving failed the
 // presubmit while the other shards passed); a job whose steps fail is a verdict, never run again.
 // Needs what `outrun check` needs: OUTRUN_API_TOKEN, OUTRUN_INSTALLATION (or --installation),
@@ -59,7 +59,7 @@ class RunRefused extends Schema.TaggedError<RunRefused>()("RunRefused", { messag
 class RunFailed extends Schema.TaggedError<RunFailed>()("RunFailed", {}) {}
 /**
  * One worker could not run a cell, for a reason of the fleet's and not of the job's: its VM lost or not
- * up, its agent reporting no job, no answer in time. The cell may run on another Mini (`redispatch`);
+ * up, its job ended with no result (`ShardOutcome`), no answer in time. The cell may run on another Mini (`redispatch`);
  * a job whose steps failed is a result (`Ran`), never this.
  */
 export class WorkerFailed extends Schema.TaggedError<WorkerFailed>()("WorkerFailed", { mini: Schema.String, message: Schema.String }) {}
@@ -79,6 +79,34 @@ export const redispatch = (cell: string, failures: readonly WorkerFailed[], bad:
         again: false,
         message: `${cell}: no worker ran it, ${failures.length} tried: ${failures.map((f) => `${f.mini}: ${f.message}`).join("; ")}`,
       };
+
+interface JobResult {
+  readonly outputs?: Record<string, unknown>;
+  readonly steps?: StepLine[];
+}
+/**
+ * What a shard's end says of its job. The job's program writes its result ({outputs, steps}) only at
+ * its end (job-script.ts), and the worker sends it back as `job` beside the program's exit code:
+ * - `Verdict`: the result came, so the job ran to its end; its exit code is its verdict.
+ * - `TimedOut`: no result and exit 124, the worker's deadline at the job's timeout-minutes: the job
+ *   failed, as GitHub cancels it.
+ * - `NoResult`: no result and any other exit: the program was killed before its end (SIGKILL, its VM
+ *   out of memory or disk: 137), never started (its file not written), or its result was lost. That
+ *   says nothing of the change: the worker's failure (`WorkerFailed`), never the job's (agent, Gabin
+ *   delegated, overnight, 2026-11-15; a red check, exit 1, until then, unless the exit was 0).
+ */
+export type ShardOutcome =
+  | { readonly _tag: "Verdict"; readonly result: "success" | "failure"; readonly job: JobResult }
+  | { readonly _tag: "TimedOut" }
+  | { readonly _tag: "NoResult"; readonly code: number };
+// The worker's exit for a job past its timeout-minutes (GNU timeout's; mac/agent checks.ts `deadline`).
+const TIMED_OUT = 124;
+export const shardOutcome = (shard: { readonly code: number; readonly json: Readonly<Record<string, unknown>> }): ShardOutcome => {
+  const job = shard.json.job;
+  if (typeof job === "object" && job !== null && !Array.isArray(job))
+    return { _tag: "Verdict", result: shard.code === 0 ? "success" : "failure", job: job as JobResult };
+  return shard.code === TIMED_OUT ? { _tag: "TimedOut" } : { _tag: "NoResult", code: shard.code };
+};
 
 // The cells running at once, at most: a check's own bound (control-plane checks.ts MAX_WORKERS).
 const MAX_CELLS = 8;
@@ -442,23 +470,30 @@ export const fleet = (
           // RESULT_SLACK_MS with no result, the worker is gone.
           const ran = yield* waitFor(got.id, got.after, (events) => events.some((e) => e.step === "shard"), sent + cell.timeoutMs + RESULT_SLACK_MS, sent);
           const shard = ran.events.find((e) => e.step === "shard")!;
-          const job = (shard.json.job ?? null) as { outputs?: Record<string, unknown>; steps?: StepLine[] } | null;
-          // A shard that ran no job script (an agent before `outrun run`), or whose result was lost, is
-          // not a verdict: what the agent did report is said, never guessed.
-          if (!job && shard.code === 0)
-            return yield* new WorkerFailed({
-              mini: got.mini,
-              message: `its agent reported no job result (exit 0, ${shard.ms} ms; reported ${JSON.stringify(Object.keys(shard.json))}); its log ends: ${shard.log.slice(-600)}`,
-            });
-          return {
-            result: shard.code === 0 ? ("success" as const) : ("failure" as const),
-            outputs: Object.fromEntries(Object.entries(job?.outputs ?? {}).map(([k, v]) => [k, String(v)])),
-            steps: Array.isArray(job?.steps) ? job.steps : [],
+          const resultOf = (result: Ran["result"], job: JobResult): Ran => ({
+            result,
+            outputs: Object.fromEntries(Object.entries(job.outputs ?? {}).map(([k, v]) => [k, String(v)])),
+            steps: Array.isArray(job.steps) ? job.steps : [],
             log: shard.log,
             ms: Date.now() - t0,
             where: `${got.mini}${got.os === "macos" ? " (macOS)" : ""}, main at ${got.sha.slice(0, 8)}`,
             ...(isLoad(shard.json.host) ? { host: shard.json.host } : {}),
-          } satisfies Ran;
+          });
+          const outcome = shardOutcome(shard);
+          switch (outcome._tag) {
+            case "Verdict":
+              return resultOf(outcome.result, outcome.job);
+            case "TimedOut":
+              return resultOf("failure", {});
+            // Not a verdict: what the agent did report is said, never guessed.
+            case "NoResult":
+              return yield* new WorkerFailed({
+                mini: got.mini,
+                message: `its job ended with no result (exit ${outcome.code}, ${shard.ms} ms; reported ${JSON.stringify(Object.keys(shard.json))}); its log ends: ${shard.log.slice(-600)}`,
+              });
+            default:
+              return outcome satisfies never;
+          }
         }).pipe(
           Effect.catchTag("NotRun", (e) => Effect.fail(new WorkerFailed({ mini: got.mini, message: e.message }))),
           Effect.ensuring(api.end(got.id)),

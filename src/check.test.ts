@@ -14,6 +14,7 @@ import {
   Repo,
   runRepoCheck,
   splitUnits,
+  stepEvents,
   timeUnits,
   type Unit,
   waitFor,
@@ -37,6 +38,8 @@ const fake = (opts: {
   // The shards a dead VM leaves unfinished (code -1), and whether the shards never answer.
   crash?: number[];
   silent?: boolean;
+  // Worker 0's shard result delivered twice (a control plane that kept both), the others' never.
+  twice?: boolean;
 }) => {
   const calls: string[] = [];
   const events: CheckEvent[] = [];
@@ -71,6 +74,12 @@ const fake = (opts: {
       Effect.sync(() => {
         calls.push(`shards ${JSON.stringify(shards)}`);
         if (opts.silent) return;
+        if (opts.twice) {
+          const json = { tasks: shards[0]!.tasks.map((id) => ({ id, ms: 10, cache: "MISS", exit: 0 })) };
+          push({ worker: names[0]!, step: "shard", code: 0, json });
+          push({ worker: names[0]!, step: "shard", code: 0, json });
+          return;
+        }
         for (const shard of shards) {
           const failed = opts.fail?.includes(shard.worker) ?? false;
           const crashed = opts.crash?.includes(shard.worker) ?? false;
@@ -161,6 +170,30 @@ describe("changeMessage", () => {
 });
 
 describe("outrun check", () => {
+  // Two events of one worker's step are one worker's: a result its Mini posted again (the answer to
+  // its post lost) was two events on a control plane before 2026-11-15, and counted as two shards.
+  it("counts a step's workers, not its events", () => {
+    const event = (worker: string, step: CheckEvent["step"], seq: number): CheckEvent => ({ seq, worker, step, code: 0, ms: 1, json: { seq }, log: "" });
+    const events = [event("w0", "apply", 1), event("w0", "shard", 2), event("w0", "shard", 3), event("w1", "apply", 4)];
+    expect(stepEvents(events, "shard")).toEqual([event("w0", "shard", 2)]);
+    expect(stepEvents(events, "apply").map((e) => e.worker)).toEqual(["w0", "w1"]);
+    expect(stepEvents(events, "up")).toEqual([]);
+  });
+
+  it.live("never passes while a shard has not reported, even when another's result came twice", () =>
+    Effect.gen(function* () {
+      const plan: Unit[] = [
+        { id: "a", ms: 10 },
+        { id: "b", ms: 10 },
+      ];
+      const { calls, layer } = fake({ workers: 2, plan, twice: true });
+      const exit = yield* Effect.exit(runRepoCheck(2, 30_000, { slackMs: 200 }).pipe(Effect.provide(layer)));
+      expect(calls.some((call) => call.startsWith("shards "))).toBe(true);
+      // Worker 1's shard never reported: the check is not run (exit 3), never passed.
+      expect(Exit.isFailure(exit) && exit.cause.reasons.map((r) => (r._tag === "Fail" ? r.error._tag : r._tag))).toEqual(["NotRun"]);
+    }),
+  );
+
   it.effect("sends HEAD's tree on the warm commit, splits the first worker's plan by the units' times, and ends the check", () =>
     Effect.gen(function* () {
       const { calls, layer } = fake({ workers: 3, plan: PLAN });
