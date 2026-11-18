@@ -307,14 +307,14 @@ iOS simulator:
 The repository needs `e2e` in its dependencies, Node on the runner, `.e2e/` git-ignored (outrun
 writes each batch's report under `.e2e/outrun-*`, inside the project root as the CLI requires), and
 the token its config's model needs. The model is the config's; an OpenAI-compatible gateway such as
-`https://ai.trait.so/v1` with a role alias (`fast`) is one line of it:
+`https://ai.trait.so/v1` with one of its model ids is one line of it:
 
 ```ts
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { E2EConfig } from "e2e";
 
 const gateway = createOpenAICompatible({ name: "trait", baseURL: "https://ai.trait.so/v1", apiKey: process.env.ACME_MODEL_TOKEN });
-export default { /* tests, targets */ agents: { default: { model: gateway("fast") } } } satisfies E2EConfig;
+export default { /* tests, targets */ agents: { default: { model: gateway("deepseek/deepseek-v4.1-flash-1017") } } } satisfies E2EConfig;
 ```
 
 ## outrun run: a workflow on outrun's VMs, from your tree
@@ -350,6 +350,113 @@ OUTRUN_API_TOKEN=ort_... OUTRUN_INSTALLATION=<id> OUTRUN_GITHUB_TOKEN=<a token t
   not run it (unreachable, no warm checkout yet, no VM free, or a job's worker lost or its program
   killed before its end on three machines in a row): run it locally instead.
   The repository must be listed in the installation's check settings.
+
+## outrun report: where a run's time goes
+
+`outrun report <run>` reads one GitHub Actions run (any run: on outrun's runners or GitHub's) and
+says where its time went: the job everyone waits on, what each job spent waiting, setting up,
+working and saving, how far the run is from its floor, which job to work on first, which step
+added time against the job's own history and whether the job kept its budget, and, on
+outrun's runners, what each cache restored and saved and whether it pays. Nothing to
+configure: it reads GitHub with your token and the workflow file that ran.
+
+```sh
+GH_TOKEN=<a token that reads the repository's Actions> outrun report https://github.com/acme/app/actions/runs/123
+outrun report 123 --repo acme/app [--attempt 2] [--json]
+```
+
+- Where: in a job, after `uses: arkadia-so/outrun@v1` (the job's `GITHUB_TOKEN` needs `actions:
+  read` and `contents: read`); elsewhere, from a clone of this repository at a release tag,
+  `bun install --frozen-lockfile`, then `bun src/main.ts report <run>`.
+- `<run>`: the run's URL (an `/attempts/<n>` in it is the attempt), or its id with `--repo
+  owner/name`. `--attempt`: that attempt (default: the run's latest). `--json`: the same figures for
+  a script. The token: `GH_TOKEN`, else `GITHUB_TOKEN` (without one, public repositories only).
+- The workflow file is read at the run's head commit: from the current checkout when it is a clone
+  of that repository and has the commit (`git show`), else GitHub's contents API; reusable workflows
+  of the same repository (`uses: ./.github/workflows/...`) too.
+- Every figure is GitHub's own timestamps, to the second, for one attempt; a job carried from an
+  earlier attempt (a re-run of failed jobs) is listed, not counted.
+
+What it prints, and how each figure is computed:
+
+- **Wall clock**: the attempt's first job queued (`created_at`) to the last step done of a job
+  that ran.
+- **Per job**: **pickup** (queued to started: the wait for a runner), then its steps, each in one
+  phase: **setup** (Set up job, the runner's own Set up runner, `Pre` steps, `actions/checkout`,
+  an action whose name contains `setup`, `actions/cache` and `actions/cache/restore`), **work**
+  (`run:` steps and every other action), **post** (`Post` steps, `actions/cache/save`, Complete
+  runner, Complete job), and the time **outside steps** (the job's span minus its steps). GitHub's
+  steps are matched to the workflow's in order, by name; when they do not match (a step count or a
+  name differs), that job's steps are **unclassified**, never guessed.
+- **Critical path**: the job that ended last, then back through its `needs:` to the need that
+  completed last, and so on. A matrix cell is its job's name with the matrix values in parentheses;
+  a reusable workflow's job is `caller / callee`. A job whose name matches no job of the file, or
+  several, is not mapped; a chain ending on it is not claimed.
+- **Slack** of a job off the path: how much later it could have ended before delaying a job that
+  needs it (that job's own time from its needs' end to its end kept) or the run's end.
+- **Speed of light (estimated)**: the run's shortest pickup + the longest work of one job (its
+  work steps: the longest unit that must run) + that job's setup no cache removes (Set up job, Set
+  up runner and checkout), and the **gap** between the wall clock and it. Not given when a job's
+  steps are unclassified.
+- **To shorten this run**: the job taking the most of the critical path (its wait after its need,
+  pickup and span) and its largest item, a step or its pickup. A lever on a job off the path
+  shortens nothing anyone waits for.
+- Without the workflow file (a dynamic workflow, a file neither the checkout nor the token can
+  read), it prints per-job times only and says why: `needs:` are never guessed from timing.
+- **History**: the same workflow's 10 most recent successful runs on the default branch created
+  before the run (so a report on an old run compares it with what came before it), each read once
+  with its jobs; a job's history is the same job, by name (matrix values included), where it
+  succeeded. The report says how many runs it read and in how many requests, and ends with every
+  request it made to GitHub.
+- **Time added**, per job: its span against its history's **n**, **median** (the middle value, the
+  mean of the two middle ones for an even n) and **p90** (nearest rank: the ⌈0.9·n⌉-th smallest), and
+  the step that added the most: a step that **appeared** (run in fewer than half of the history's
+  runs; a skipped step counts as absent), with its whole time, or one that **grew**, more than 1 s
+  over its history's p90 (GitHub's step times are whole seconds), by its time minus its history's
+  median. Growth within that is not reported. Every other step that appeared is listed after it. A
+  step name used twice in a job is matched by occurrence. Under 3 runs of history, no step is weighed and it says so. So on the run that adds a
+  check, the check's cost is printed.
+- **Budget**, per job: its `timeout-minutes` (a reusable workflow's job: the callee's), else, when
+  unset or an expression, the p90 of its history (3 runs at least); `!` and by how much when the
+  job's span went over it. Nothing to configure: a budget is never an outrun setting.
+- **Cache**, per job, from the cache ledger outrun's runners print in each job's log (its "Complete
+  runner" step, ending with one line `job-report v2 <json>` that holds the ledger and the job's load;
+  read through GitHub's run logs archive, else its job logs API): each restore (the key asked, the key found, an **exact** hit, a **partial** hit on a restore
+  key, or a **miss**, the bytes, where they came from, the transfer time, their sha256) and each save
+  (key, bytes, from its creation to its finalization, **saved**, **exists** when the cache already
+  held the key, **given-up** past the save's deadline, or **failed**, and the sha256 of the bytes
+  saved when it was computed exactly), each in the step whose time holds it (GitHub's step times are
+  to the second: a step holds an event from its start's second to the second after its end; an
+  event in a boundary second of two steps is in neither). What the ledger could not measure is
+  printed "not measured", never guessed. A job with no ledger says why: not run on outrun's runners,
+  a run from before the ledger existed, or its cache calls went to GitHub's cache.
+- **Flags**: a save whose step takes longer than the job's own work (its work steps); a save of
+  **unchanged content**, whose sha256 equals that of bytes the job restored before it (never on size
+  alone); and, over the same job's 10 most recent successful runs of the same workflow on the
+  default branch, a cache whose **cost** (the median restore step on an exact hit plus the median
+  save step on a miss) is not less than what it **avoids** (the median rest of the job on a miss
+  minus on an exact hit), one verdict per restore step, one sample per run: a step whose restores all
+  hit exactly is a hit, all missed a miss, else partial (a setup action restoring two caches, one
+  missed), counted in neither. Under 3 runs of a hit or 3 of a miss with a ledger: "not enough runs",
+  with how many of each, never a verdict.
+- **Contention**, per job, from the same line: for each step, its CPU (mean and peak, of the
+  machine's vCPUs), its peak memory against the job's (its cgroup's `memory.max`, else the machine's
+  memory), and on Linux the share of its time some task waited for a CPU and for memory (the "some"
+  totals of the kernel's pressure stall information over the step, between two samples 2 s apart or
+  more within it, else "not measured") and the
+  processes the kernel's OOM killer killed; on macOS the system's memory pressure level instead, CPU
+  pressure and OOM kills "not measured"; and whether it ended with exit code 137. **Flags**, with
+  their thresholds printed beside them: **workers beyond the cores** (tasks waited for a CPU over 25%
+  of a step's time while it used 80% or more of the vCPUs), **memory pressure** (tasks waited for
+  memory over 10% of its time, its peak reached 90% of the job's memory, or macOS's pressure level
+  reached warning), **a process killed** (an OOM kill, named when the kernel's log says which, or exit
+  code 137). These are what make more parallelism slower: more workers than cores wait for one
+  another, and more than the memory holds reclaim, swap or get killed; a bigger runner is the costly
+  answer, fewer workers the free one. A job with no figures says why (not run on outrun's runners, or
+  before they recorded them), and a job whose steps held no sample (sampled every second) says that,
+  never "none flagged".
+
+Exit 0: printed; 1: GitHub did not answer (the run, its jobs); 2: the arguments.
 
 ## outrun check: the fast CI on outrun's VMs
 

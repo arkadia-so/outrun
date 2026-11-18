@@ -1,6 +1,7 @@
 // The engine's own state on this machine: the import scans by blob (a file's imports are read
 // once per content) and the local verdict cache. Under $OUTRUN_STATE_DIR, else
 // $XDG_CACHE_HOME/outrun, else ~/.cache/outrun.
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { mkdir, rename } from "node:fs/promises";
 import { homedir } from "node:os";
 import { Effect } from "effect";
@@ -47,12 +48,14 @@ export const loadCells = (dir: string) =>
     catch: () => new FileFailed({ message: `${dir}/${CELLS}: unreadable` }),
   });
 
+// Synchronous on purpose: it runs at the end of `outrun run`, whose exit waits for it, and the asynchronous mkdir,
+// write and rename there took up to 12.5 s on a loaded laptop (issue #559) for a file of a few hundred bytes.
 export const saveCells = (dir: string, cells: Cells) =>
-  Effect.tryPromise({
-    try: async () => {
-      await mkdir(dir, { recursive: true });
-      await Bun.write(`${dir}/${CELLS}.tmp`, JSON.stringify(cells));
-      await rename(`${dir}/${CELLS}.tmp`, `${dir}/${CELLS}`);
+  Effect.try({
+    try: () => {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(`${dir}/${CELLS}.tmp`, JSON.stringify(cells));
+      renameSync(`${dir}/${CELLS}.tmp`, `${dir}/${CELLS}`);
     },
     catch: () => new FileFailed({ message: `${dir}/${CELLS}: not writable` }),
   });

@@ -74,5 +74,29 @@ export const blobs = (repo: string) =>
 export const status = (repo: string) =>
   run(["status", "--porcelain=v1", "-z", "--untracked-files=all"], repo).pipe(Effect.map((out) => new Set(decoder.decode(out).split("\0").filter(Boolean))));
 
+/**
+ * A file's text at a commit of the checkout at [cwd], when that checkout is a clone of [repository]
+ * (`owner/name`) and has the commit; undefined otherwise (another repository, the commit not fetched).
+ */
+export const show = (cwd: string, repository: string, sha: string, path: string) =>
+  Effect.gen(function* () {
+    const origin = decoder.decode(yield* run(["remote", "get-url", "origin"], cwd));
+    if (repositoryOf(origin)?.toLowerCase() !== repository.toLowerCase()) return undefined;
+    const has = yield* run(["cat-file", "-e", `${sha}^{commit}`], cwd).pipe(
+      Effect.as(true),
+      Effect.catchTag("GitFailed", () => Effect.succeed(false)),
+    );
+    if (!has) return undefined;
+    return decoder.decode(yield* run(["show", `${sha}:${path}`], cwd));
+  });
+
 /** The commit checked out. */
 export const head = (repo: string) => run(["rev-parse", "HEAD"], repo).pipe(Effect.map((out) => decoder.decode(out).trim()));
+
+// The GitHub repository (`owner/name`) an origin URL names: GitHub's own (https or ssh), or outrun's
+// git proxy, which an agent sandbox clones through (`…/v1/git/<sandbox>/<owner>/<repo>.git`: the
+// sandbox has no GitHub credential, outrun/README.md "Agent sandboxes"). Undefined for anything else.
+export const repositoryOf = (origin: string): string | undefined =>
+  /(?:github\.com[:/]|\/v1\/git\/sbx_[0-9a-f]+\/)([\w.-]+\/[\w.-]+?)(?:\.git)?\s*$/.exec(origin)?.[1];
+// An origin URL as a message may show it: without the credential a clone through a proxy carries.
+export const shownOrigin = (origin: string): string => origin.trim().replace(/\/\/[^/@]+@/, "//");

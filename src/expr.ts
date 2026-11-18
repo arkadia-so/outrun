@@ -284,6 +284,16 @@ const property = (target: Value, key: Value): Value => {
   return null;
 };
 
+// A filter (`needs.*`) and what is read through it (`needs.*.result`) are arrays whose every read
+// applies to each item, as GitHub's object filters: `needs.*.result` is each need's result, and an
+// item without the property is left out.
+const filtered = (node: Node): boolean => node.kind === "star" || (node.kind === "index" && filtered(node.target));
+
+const children = (target: Value): readonly Value[] => {
+  if (target === null || typeof target !== "object") return [];
+  return Array.isArray(target) ? target : Object.values(target);
+};
+
 export interface Scope {
   // The contexts known now, by lower-case name.
   readonly contexts: Readonly<Record<string, Value>>;
@@ -303,12 +313,18 @@ export const evaluate = (node: Node, scope: Scope): Value => {
       if (!(node.name in scope.contexts)) throw new ExprError(`the context "${node.name}" is not available here`);
       return scope.contexts[node.name] ?? null;
     }
-    case "index":
-      return property(evaluate(node.target, scope), evaluate(node.key, scope));
+    case "index": {
+      const target = evaluate(node.target, scope);
+      const key = evaluate(node.key, scope);
+      if (!filtered(node.target)) return property(target, key);
+      return children(target).flatMap((item) => {
+        const value = property(item, key);
+        return value === null ? [] : [value];
+      });
+    }
     case "star": {
       const target = evaluate(node.target, scope);
-      if (target === null || typeof target !== "object") return [];
-      return Array.isArray(target) ? target : Object.values(target);
+      return filtered(node.target) ? children(target).flatMap(children) : children(target);
     }
     case "not":
       return !truthy(evaluate(node.operand, scope));

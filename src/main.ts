@@ -27,6 +27,9 @@ import { appendFile } from "node:fs/promises";
 //   outrun check [--workers n] [--installation id]
 //                                HEAD's tree through the repository's .outrun/check.json on outrun's
 //                                Linux VMs: exit 0 passed, 1 failed, 3 not run there
+//   outrun report <run URL | id --repo owner/name> [--attempt n] [--json]
+//                                where a run's time went: its critical path, each job's pickup, setup,
+//                                work and post, its speed of light (GH_TOKEN or GITHUB_TOKEN)
 //   outrun nx-cache [--port n]   Nx's self-hosted remote cache API on 127.0.0.1, stored in outrun's cache
 //   outrun bazel-cache [--port n] Bazel's HTTP remote cache on 127.0.0.1, stored in outrun's cache
 //
@@ -49,6 +52,7 @@ import { CacheUnavailable, FileFailed, TestsFailed, UsageInvalid } from "./error
 import * as Git from "./git.ts";
 import { mergeJunit, parseJunit } from "./junit.ts";
 import { hashedEnv, keyedEnv, machineFingerprint } from "./machine.ts";
+import { reportCommand } from "./report.ts";
 import { runCommand } from "./run.ts";
 import { restoreEntry, saveEntry } from "./tier.ts";
 import type { Remote } from "./upstream.ts";
@@ -511,6 +515,7 @@ const outrun = Command.make("outrun").pipe(
     verdictsCommand,
     checkCommand,
     runCommand,
+    reportCommand,
   ]),
 );
 
@@ -529,6 +534,7 @@ const main = Command.run(outrun, { version: pkg.version }).pipe(
     RunFailed: () => Effect.succeed(1),
     RunRefused: (e) => Console.error(`outrun run: refused before anything ran:\n${e.message}`).pipe(Effect.as(2)),
     NotRun: (e) => Console.error(`outrun: not run on the fleet: ${e.message}`).pipe(Effect.as(3)),
+    ReportFailed: (e) => Console.error(`outrun report: ${e.message}`).pipe(Effect.as(1)),
   }),
   Effect.catchIf(CliError.isCliError, () => Effect.succeed(2)),
   Effect.provide(BunServices.layer),

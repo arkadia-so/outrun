@@ -2,10 +2,13 @@
 name: outrun
 description: >-
   Move a repository's GitHub Actions CI to outrun (outrun.sh) and make it as fast as it can be:
-  the one-line move to outrun's runners, the measurement protocol (pickup, checkout, setup, work,
-  cache saves; cold, warm, one-file and wide changes), the levers ranked by measured gain (warm
+  the one-line move to outrun's runners, the measurement protocol (`outrun report` on a run: the
+  critical path, each job's pickup, setup, work and post, the speed of light, the step a change
+  added against the job's history and its budget, the cache ledger and whether each cache pays, CPU
+  and memory contention; cold, warm, one-file and wide changes), the levers ranked by measured gain (warm
   runners, split and time-balanced test jobs, affected-only tests on push, `outrun run` for the
-  pre-push gate, caches kept on the machines, the image's tools, e2e sharding and replay), the traps
+  pre-push gate, caches kept on the machines, the image's tools, e2e sharding and replay, and the
+  work itself: a faster tool for a check, what each test has to prove), the traps
   already hit with their fixes, what the repository's owner decides versus what an agent may change
   (with each change's rollback), and when the work is done. Use when a repository moves to outrun,
   when its CI or its pre-push check is slow, when a job on outrun fails in a way it did not on
@@ -18,7 +21,7 @@ This is the playbook for an agent, working for a repository's owner, that moves 
 outrun and then makes it as fast as possible. Every figure comes from a real customer's CI, measured
 before and after the change. Most of them come from **a Flutter + TypeScript monorepo** with Linux,
 Android, iOS and simulator end-to-end jobs. Reference: [README.md](../../README.md) (the CLI, the
-action, `outrun run`, `outrun e2e`), and [outrun.sh](https://outrun.sh).
+action, `outrun report`, `outrun run`, `outrun e2e`), and [outrun.sh](https://outrun.sh).
 
 Three rules hold throughout:
 
@@ -86,20 +89,45 @@ does. It is not there yet.
 
 ## 2. Measure
 
-Take every figure from GitHub's API, never from memory or the UI's rounded times.
-
-- **Per job:** `created_at → started_at` is the pickup (queue). `started_at → completed_at` is the job.
-- **Per step:** "Set up job", checkout, setup (toolchain, dependencies, cache restore), the work,
-  and the post steps (cache saves).
-- **Per run:** the wall clock, and its critical path (the chain of `needs:` that ends last).
+Take every figure from GitHub's own timestamps, never from memory or the UI's rounded times.
+`outrun report` computes them from one run, with nothing to configure: it reads the run, its jobs,
+the workflow file that ran and the job's earlier runs with your token, and works on any run, on
+outrun's runners or GitHub's (so measure a run before the move too).
 
 ```sh
-gh api "repos/$REPO/actions/runs/$RUN/jobs?per_page=100" --jq '.jobs[] | [.name,
-  (((.started_at|fromdate)-(.created_at|fromdate))|tostring)+"s queued",
-  (((.completed_at|fromdate)-(.started_at|fromdate))|tostring)+"s run"] | @tsv'
-gh api "repos/$REPO/actions/jobs/$JOB" --jq '.steps[] | [.name,
-  ((.completed_at|fromdate)-(.started_at|fromdate))] | @tsv'
+GH_TOKEN=<a token that reads the repository's Actions> \
+  outrun report https://github.com/<owner>/<repo>/actions/runs/<id>   # --json for a script
 ```
+
+In a job, the CLI is on the PATH after `uses: arkadia-so/outrun@v1` (the job's `GITHUB_TOKEN` with
+`actions: read` and `contents: read` is enough); elsewhere, from a clone of `arkadia-so/outrun` at its latest tag:
+`bun install --frozen-lockfile`, then `bun src/main.ts report <run>`. Read its output in this order:
+
+- **Wall clock**: the first job queued to the last step done.
+- **Critical path**: the chain of `needs:` that ends last, the job everyone waits on. Per job:
+  **pickup** (queued to started: the wait for a runner), **setup** (Set up job, checkout, `setup-*`
+  actions, cache restores), **work** (`run:` steps and other actions), **post** (`Post` steps, cache
+  saves), the time outside steps, and how long it queued after its need ended. Jobs off the path
+  come with their **slack**: how much longer they could take without delaying anyone.
+- **Speed of light (estimated)** and the **gap** to it: the run's shortest pickup, plus the longest
+  work of one job, plus that job's setup no cache removes. The gap is what a lever can still win.
+- **To shorten this run**: the job taking most of the critical path, and its largest step or its
+  pickup. Start there (section 3).
+- **Time added**: each job against the same job in the workflow's 10 earlier successful runs on the
+  default branch (n, median, p90), and the step that appeared or grew past its history's spread, by
+  how much. On the run that adds a check, its cost is printed. Then each job's **budget**: its
+  `timeout-minutes`, else the p90 of that history; `!` marks a job over it.
+- **Cache** (outrun's runners only): each restore and save of each job, the key, exact or partial
+  hit or miss, bytes, transfer time, in which step. `!` flags a save longer than the job's own work,
+  and a save of the same bytes the job restored (unchanged content).
+- **Does each cache pay?**: per restore step, over the same job's recent successful runs on the
+  default branch (lever 1).
+- **Contention** (outrun's runners only): per step, CPU against the vCPUs, peak memory against the
+  job's, and the time tasks waited for a CPU or memory; `!` flags workers beyond the cores, memory
+  pressure, a process killed (lever 2).
+- What a runner or the platform cannot measure is printed "not measured", with why; never read it
+  as zero. A job without a cache or contention section did not run on outrun's runners, or ran
+  before they recorded it.
 
 Measure four cases, each at least three times, and report min, median and max with run ids:
 
@@ -110,9 +138,9 @@ Measure four cases, each at least three times, and report min, median and max wi
 | **Narrow**: a one-file change | what an agent waits for on most pushes |
 | **Wide**: a change to a file most of the code depends on | the worst push |
 
-Measure the same commit on the old runners and on outrun. Then work out the run's **speed of light**:
-one pickup, plus the longest unit of work that must run, plus the setup that cannot be cached. The
-gap between a job and its speed of light is where the next lever is. Other runs of the same
+Measure the same commit on the old runners and on outrun, with `outrun report` on each run. The
+**speed of light** it prints is one pickup, plus the longest unit of work that must run, plus the
+setup that cannot be cached; the gap between the run and it is where the next lever is. Other runs of the same
 organisation contend for the same runners, so note what else was running. Rerun a figure that looks
 off on a quiet moment before believing it.
 
@@ -121,16 +149,40 @@ off on a quiet moment before believing it.
 Work in this order, measuring after each lever. The figures come from the Flutter + TypeScript
 monorepo unless stated otherwise.
 
+**Start from the run, not from this list.** Run `outrun report` on one real run (section 2): its
+critical path is the job everyone waits on, and its "to shorten this run" line names the job and
+the step to work on. A lever on a job outside that chain changes nothing a person or an agent waits
+for (its slack says by how much it could grow first): with a 10 min build and a 1 min lint, an
+instant lint still leaves 10 min. And a larger runner is the last lever, not the first: it is paid
+on every run, while work removed is removed for good.
+
 1. **Saves that dominate a job.** Look at every post step first.
    - A lint job spent **248 s of its 324 s saving the analyzer's cache** to the Actions cache. The
      analysis itself took 4 s.
    - Without that save, the job took **50 s**.
    - Rule: save a cache only from the default branch, only when its key changed, and never one that
      takes longer to save than the work it saves.
+   - A cache hit is not a faster job by itself. `outrun report`'s "does each cache pay?" compares,
+     per restore step over the same job's recent successful runs on the default branch, its
+     **cost** (the median restore step on an exact hit plus the median save step on a miss) with
+     what it **avoids** (the median rest of the job on a miss minus on an exact hit): a cold run
+     against a warm one. Drop the cache that loses. Under 3 hits or 3 misses it says "not enough
+     runs": wait for more, never judge one run.
+   - Its cache section flags a save that takes longer than the job's work, and a save of content
+     the job had just restored unchanged: both are saves to restrict.
 2. **Split the test job, shard it by measured times.**
    - One `flutter test` job took **393 s**. Split into up to 8 jobs, it took **26–53 s per job**.
    - Balance shards by each file's last measured duration, not by file count. `outrun plan` and
      `outrun test --shard` do it (README).
+   - Measure each level of parallelism instead of assuming more is faster: workers beyond the
+     machine's cores or memory compete with one another (a team reported a build made slower by
+     extra build workers; not measured by us). Run the job at each worker count, three times each,
+     and read `outrun report`'s step times and its contention section: **workers beyond the
+     cores** (tasks waited for a CPU over a quarter of the step while it used most of the vCPUs),
+     **memory pressure** (tasks waited for memory, or its peak neared the job's memory), **a process
+     killed** (an OOM kill, exit 137). A flagged count is past the useful level: keep the fastest
+     count with no flag. Fewer workers is the free answer; a bigger runner is the costly one, paid
+     on every run.
    - With the move to arm64 and warm caches, the whole push CI went from **591 s to 138–160 s**.
 3. **Pickup and warm runners.**
    - After the move, the queue was the largest share of a run: 10–60 s per job, and 146–167 s on
@@ -193,7 +245,26 @@ monorepo unless stated otherwise.
    Measured: a 34-test iOS suite went from ~39 min on a hosted macOS provider to **10.1 min**. A
    later 16-shard run of the same suite took **413 s**: 2,081 s of tests in total, and model calls
    down from 232 to 107.
-9. **The critical path last.**
+9. **The work itself: what a check does, and with which tool.** The levers above make the same work
+   start sooner and run in parallel; this one removes work. Not measured by us: the figures are one
+   team's, on a content site of thousands of static pages (2026-11), from separate experiments.
+   - **A faster tool for the same check.** Reported: lint 107 s → 3 s (ESLint to Oxlint), format
+     37 s → 1 s (Prettier to Oxfmt), type check 67 s → 17 s (TypeScript's native compiler),
+     dependency install 3–6 s with Bun while builds and tests stayed on Node. Change one tool at a
+     time, and hold the check to what it caught before: list the lint rules the new tool lacks, and
+     make sure a faster type check still reads every file the old one read (templates, generated
+     code). A check that silently covers less is not a speed-up.
+   - **What each test has to prove.** When thousands of inputs go through one template, test the
+     template on representative cases and validate the inputs apart, without a browser. Keep
+     browser tests for navigation, interaction and integration: loading every page to repeat one
+     assertion is the expensive way to prove it once.
+   - **A build that fits the product.** The same team's build treated each article as a route of
+     its own; grouping them, then building the content as static HTML, brought a full build to
+     33–35 s.
+   - These change what the repository checks or ships, so they are the owner's to decide (section
+     5): bring the measured time of the step, the tool or test you would change, and what would no
+     longer be covered.
+10. **The critical path last.**
    - Move the remaining jobs (plan, gate) only after measuring: moving them gave 114–167 s → 126–268 s
      on a busy hour, a loss until rerun on a quiet one.
    - Fold small jobs into the job that needs them, since each job costs a pickup.
@@ -210,8 +281,9 @@ monorepo unless stated otherwise.
 | A cache moved to a new store, writers first | A job misses, or fails on a missing file, restoring what an earlier job just saved, on some runners only. A job that untars a build without checking the restore hit fails further on. | The new store (a new key, path, tier or cache service) reached the writers before every reader: a save to the new store is invisible to a job still reading the old one, and runners or branches move one by one. | Readers first: every reader looks in the new store and falls back to the old one. Turn writes to the new store on only once every reader reads it. Check that a restore hit before using what it restores. |
 | Jobs lost to the infrastructure | Shards get a runner, run no step and fail at the job's timeout. Rerunning one shard then makes GitHub refuse the others (403). | The runners were restarted under running jobs. | Rerun all failed jobs together (`gh run rerun $RUN --failed`), never one by one. Report the run id to outrun. |
 | Network errors in a burst | ENOTFOUND, ECONNRESET, a TLS handshake taking seconds, 504s downloading a tool from GitHub. | Many new connections at once, or the upstream server failing. | Retry every download with backoff (3 tries). Prefer the image's tools. Pin tools by version and checksum. |
+| An install with no network misses the package cache | The job's install succeeds, then a step that installs again with no network (a sandbox, a network namespace, a container given the job's package cache) fails: `DNSResolveFailed downloading tarball <package>`, ENOTFOUND. | A job's user configuration (`~/.npmrc`) may name a package mirror close to the runner as the default registry. Bun and npm key their cache by registry, so a process that does not read that file (another home, an allowlisted sandbox) looks for the public registry's entries, finds none and downloads. | Tell the inner process the registry the job's install used: `NPM_CONFIG_REGISTRY="$(npm config get registry)"` in its environment, or let it read `~/.npmrc`. |
 | arm64 gaps | `flutter` has no Linux arm64 archive. Android's build tools fail on arm64. `gh`, `zip`, `sqlite3`, `pip` or `aws` are missing. | Upstream ships x64 only, or the image lacks the tool. | Install Flutter from its git tag and run `precache`. Keep Android jobs on an x64 label. Install a missing tool only when `command -v` fails. |
-| Out of memory | A test job is SIGKILLed (exit 137) only on some runs. | The job's peak memory (one suite: 4.9 GB, one file 2.1 GB) exceeded a smaller VM. | Measure the peak RSS. Ask for a larger runner, or split the job. |
+| Out of memory | A test job is SIGKILLed (exit 137) only on some runs. | The job's peak memory (one suite: 4.9 GB, one file 2.1 GB) exceeded a smaller VM. | Read the step's peak memory and the kill in `outrun report`'s contention section. Fewer workers or a split job first; a larger runner last. |
 | A file outside the checkout | A test passes on a laptop and fails in CI after a sparse or per-folder checkout. | The test reads another package's file. | Add the path to the job's checkout and its selection inputs. |
 | Commit messages lost in `outrun check` (older gate) | A plan that reads `git log "$OUTRUN_CHECK_BASE..HEAD"` (trailers, `[skip …]` flags) sees one commit named "outrun check". | Before outrun 1.5.3, the VM committed the patch with its own message. | Use `arkadia-so/outrun@v1`, or pin 1.5.3 or later. |
 | Too few workers for a wide check (`outrun check`, older gate) | A wide change plans 547 units. `outrun check --workers 4` prints `1 worker(s)`. The one shard (~500 s expected) is cut at ~240 s with `no answer in time`, three times. The push cannot land. | Fewer workers were free than asked for, and the share outran a time limit. | Any outcome other than a verdict, and any worker count below the request on a wide change, means "not run": run the check locally (exit 3 means the same). Name the units over `--target` and split them, so a wide change still fits on few workers. |
@@ -239,6 +311,8 @@ monorepo unless stated otherwise.
   - affected-only selection on push;
   - moving e2e or native builds off the gate;
   - a test dropped, quarantined or rewritten;
+  - a linter, formatter, type checker, package manager or build tool replaced (lever 9): say which
+    rules or files the new one does not cover;
   - test-only hooks added to the app (debug deep links, clock shortcuts).
 - **Settings on outrun's side:**
   - warm runners, and how many (they are machines waiting for the repository);
@@ -261,6 +335,12 @@ monorepo unless stated otherwise.
 - **End-to-end tests:** off the gate. Wall clock about the longest test plus ~60 s of fixed cost
   per shard.
 - **Measurements:** every figure taken at least three times, with run ids.
+- **It stays fast:** each layer has a time budget written in the repository, in its workflow (the
+  gate's 30 s, the push CI's 3 min), and each job its `timeout-minutes`. `outrun report` holds each
+  job to it (or, without one, to the p90 of its history) and marks a job over it with `!`; on the
+  run that adds a check, its "time added" prints what the check costs. A new check says which
+  failure it catches, what already covers that failure and what it adds to its layer's budget; a
+  layer over its budget is a problem to fix, not a number to raise. No check is free.
 
 Report to the owner in this shape:
 
@@ -270,6 +350,7 @@ Report to the owner in this shape:
 | Cold / Warm / One-file / Wide / Pre-push one-file / E2E full | min–max s, ids | min–max s, ids | × |
 Levers applied: <lever>: <before> → <after> (<commit>), rollback: <command or revert>.
 Traps hit: <symptom>: <fix>.
+Tried, no gain: <lever or tool>: <before> → <after>, so that the next agent does not try it again.
 Left, by expected gain: <lever>: <expected gain>, <who decides>.
 Needs your decision: <one line each, with the measured gain>.
 ```

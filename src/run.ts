@@ -19,7 +19,7 @@ import { spawnSync } from "node:child_process";
 // presubmit while the other shards passed); a job whose steps fail is a verdict, never run again.
 // Needs what `outrun check` needs: OUTRUN_API_TOKEN, OUTRUN_INSTALLATION (or --installation),
 // OUTRUN_API, OUTRUN_GITHUB_TOKEN.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
 import * as Argument from "effect/cli/Argument";
 import * as Command from "effect/cli/Command";
@@ -36,6 +36,7 @@ import * as Scoped from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import { CheckApi, checkApiLive, NotRun, Repo, repoLive, treeOf, waitFor } from "./check.ts";
 import { condition, evaluate, interpolate, type Scope, truthy, type Value } from "./expr.ts";
+import { repositoryOf, shownOrigin } from "./git.ts";
 import { basePrelude, compileJob, RUN_MAX_MINUTES } from "./job-script.ts";
 import { type Cells, loadCells, saveCells, stateDir } from "./state.ts";
 import {
@@ -348,6 +349,27 @@ interface Ready {
   readonly sha: string;
   readonly after: number;
   readonly at: number;
+  // Its start, in ms: the check created (a VM given, 409 waits included), then the tree sent and applied.
+  readonly createMs: number;
+  readonly applyMs: number;
+}
+
+/**
+ * Where a cell's time went (`--timings`), in ms: `vm` from the cell's start to a VM ready in hand (all
+ * of `createMs` + `applyMs` for a VM started for it, what was left of them for one started ahead), `run`
+ * from its program sent to its result back, and the VM's own steps. `run` minus the steps is the dispatch
+ * and the answer's way back.
+ */
+interface CellTiming {
+  readonly job: string;
+  readonly name: string;
+  readonly mini: string;
+  readonly ms: number;
+  readonly vm: number;
+  readonly createMs: number;
+  readonly applyMs: number;
+  readonly run: number;
+  readonly steps: readonly { readonly name: string; readonly ms: number; readonly conclusion: string }[];
 }
 
 /**
@@ -381,6 +403,7 @@ export const fleet = (
     // The VMs' starts belong to the run, not to the cell or job that asked for them.
     const starts = yield* Scoped.make();
     const learned: Record<string, number> = {};
+    const timings: CellTiming[] = [];
     // The Minis that failed a worker of this run: no later VM of the run is asked or taken there.
     const bad = new Set<string>();
 
@@ -393,6 +416,7 @@ export const fleet = (
         const check = yield* api
           .create(repo, 1, true, base?.sha, os === "macos" ? "macos" : undefined, [...bad].sort())
           .pipe(Effect.retry({ schedule: Schedule.spaced("3 seconds"), while: (e) => / 409 full\b/.test(e.message) && Date.now() - t0 < READY_MS }));
+        const created = Date.now();
         return yield* Effect.gen(function* () {
           const worker = check.workers[0];
           if (!worker) return yield* new NotRun({ message: "the fleet gave no VM" });
@@ -408,7 +432,8 @@ export const fleet = (
             return ready;
           }).pipe(Effect.mapError((e) => new WorkerFailed({ mini: worker.mini, message: e.message })));
           idle.add(check.id);
-          return { id: check.id, os, mini: worker.mini, sha, after: ready.after, at: Date.now() } satisfies Ready;
+          const at = Date.now();
+          return { id: check.id, os, mini: worker.mini, sha, after: ready.after, at, createMs: created - t0, applyMs: at - created } satisfies Ready;
         }).pipe(Effect.onError(() => api.end(check.id)));
       });
 
@@ -466,19 +491,35 @@ export const fleet = (
             },
           ]);
           const sent = Date.now();
+          const vmMs = sent - t0;
           // The job's own timeout-minutes is enforced in its VM (a failure, its log kept): past it and
           // RESULT_SLACK_MS with no result, the worker is gone.
           const ran = yield* waitFor(got.id, got.after, (events) => events.some((e) => e.step === "shard"), sent + cell.timeoutMs + RESULT_SLACK_MS, sent);
           const shard = ran.events.find((e) => e.step === "shard")!;
-          const resultOf = (result: Ran["result"], job: JobResult): Ran => ({
-            result,
-            outputs: Object.fromEntries(Object.entries(job.outputs ?? {}).map(([k, v]) => [k, String(v)])),
-            steps: Array.isArray(job.steps) ? job.steps : [],
-            log: shard.log,
-            ms: Date.now() - t0,
-            where: `${got.mini}${got.os === "macos" ? " (macOS)" : ""}, main at ${got.sha.slice(0, 8)}`,
-            ...(isLoad(shard.json.host) ? { host: shard.json.host } : {}),
-          });
+          const back = Date.now();
+          const resultOf = (result: Ran["result"], job: JobResult): Ran => {
+            const steps = Array.isArray(job.steps) ? job.steps : [];
+            timings.push({
+              job: cell.job,
+              name: cell.name,
+              mini: got.mini,
+              ms: back - t0,
+              vm: vmMs,
+              createMs: got.createMs,
+              applyMs: got.applyMs,
+              run: back - sent,
+              steps: steps.map((step) => ({ name: step.name, ms: step.ms, conclusion: step.conclusion })),
+            });
+            return {
+              result,
+              outputs: Object.fromEntries(Object.entries(job.outputs ?? {}).map(([k, v]) => [k, String(v)])),
+              steps,
+              log: shard.log,
+              ms: back - t0,
+              where: `${got.mini}${got.os === "macos" ? " (macOS)" : ""}, main at ${got.sha.slice(0, 8)}`,
+              ...(isLoad(shard.json.host) ? { host: shard.json.host } : {}),
+            };
+          };
           const outcome = shardOutcome(shard);
           switch (outcome._tag) {
             case "Verdict":
@@ -528,7 +569,7 @@ export const fleet = (
       yield* Effect.forEach([...idle], (id) => Effect.sync(() => idle.delete(id)).pipe(Effect.andThen(api.end(id))), { discard: true });
       return learned;
     });
-    return { runCell, ahead, close };
+    return { runCell, ahead, close, timings };
   });
 
 // The workflow file: a path, or a name in the repository's .github/workflows.
@@ -551,6 +592,10 @@ const flags = {
   ref: Flag.String("ref").pipe(Flag.withDescription("run exactly this commit's tree (default: HEAD with the working tree's changes)"), Flag.withDefault("")),
   installation: Flag.String("installation").pipe(
     Flag.withDescription("the installation id the token belongs to (default: OUTRUN_INSTALLATION)"),
+    Flag.withDefault(""),
+  ),
+  timings: Flag.String("timings").pipe(
+    Flag.withDescription("write where the run's time went to this file, as JSON: its start, each cell's wait for a VM, run and steps, its close"),
     Flag.withDefault(""),
   ),
 };
@@ -604,82 +649,140 @@ const cacheEnvOf = (api: string, installation: string, token: string, repository
     return { OUTRUN_RUN: "true", ...(minted ? { OUTRUN_CACHE_URL: url, OUTRUN_CACHE_TOKEN: minted } : {}) };
   });
 
+/**
+ * A whole workflow that passed on a tree, recorded with outrun (`POST …/passed-runs`, control-plane
+ * passed-runs.ts): what the git proxy of an agent sandbox reads before it lets the sandbox land that
+ * exact tree on its repository's branch (outrun/README.md "Agent sandboxes"). Not a run of some jobs
+ * only (`--job`). Never the run's verdict: a record that could not be made is said in one line, and a
+ * push that needs it is then refused, saying to run again.
+ */
+const recordPassed = (api: string, installation: string, token: string, repository: string, workflow: string, head: string) =>
+  Effect.gen(function* () {
+    const tree = spawnSync("git", ["rev-parse", "--verify", `${head}^{tree}`], { encoding: "utf8" }).stdout.trim();
+    const answer = yield* Effect.tryPromise({
+      try: async (signal) => {
+        const response = await fetch(`${api}/v1/installations/${installation}/passed-runs`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify({ repo: repository, workflow, tree }),
+          signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+        });
+        return response.ok ? "" : `HTTP ${response.status}`;
+      },
+      catch: (cause) => String(cause),
+    }).pipe(Effect.result);
+    const failed = answer._tag === "Failure" ? answer.failure : answer.success;
+    if (failed)
+      yield* Console.error(`outrun run: the passed run was not recorded for tree ${tree.slice(0, 12)} (${failed}): a sandbox's landing of it would be refused`);
+  });
+
 const handler = ({
   workflow: name,
   job,
   field,
   ref,
   installation,
+  timings,
 }: {
   readonly workflow: string;
   readonly job: readonly string[];
   readonly field: readonly string[];
   readonly ref: string;
   readonly installation: string;
+  readonly timings: string;
 }) =>
   Effect.gen(function* () {
     const t0 = Date.now();
-    const found = locate(name);
-    if (!found) return yield* new RunRefused({ message: `${name}: no such workflow file (a path, or a name in .github/workflows)` });
-    // The repository's name first: a refusal names its own repository's checkout as allowed.
-    const origin = spawnSync("git", ["remote", "get-url", "origin"], { encoding: "utf8" }).stdout.trim();
-    const repository = /github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?$/.exec(origin)?.[1] ?? "";
-    const { workflow, jobs, inputs } = yield* prepare(found.shown, readFileSync(found.file, "utf8"), job, field, repository);
-    if (!repository) return yield* new NotRun({ message: `origin is not a GitHub repository: ${origin}` });
-    const token = process.env.OUTRUN_API_TOKEN;
-    if (!token) return yield* new NotRun({ message: "OUTRUN_API_TOKEN is not set (an installation's API token)" });
-    const id = installation || process.env.OUTRUN_INSTALLATION || "";
-    if (!/^\d+$/.test(id))
-      return yield* new NotRun({ message: "no installation: set OUTRUN_INSTALLATION or pass --installation (its GitHub App installation id)" });
-    const api = process.env.OUTRUN_API ?? "https://api.outrun.sh";
-    const githubToken = process.env.OUTRUN_GITHUB_TOKEN || undefined;
-    if (!githubToken) yield* Console.error("outrun run: OUTRUN_GITHUB_TOKEN is not set: the warm checkouts stay at the commit the Minis' mirrors have");
-    // The run's cache token while the tree is read: no time on the run's path.
-    const [cacheEnv, tree] = yield* Effect.all([cacheEnvOf(api, id, token, repository), treeOf(ref || undefined)], { concurrency: 2 });
-    const branch = spawnSync("git", ["symbolic-ref", "-q", "HEAD"], { encoding: "utf8" }).stdout.trim() || "refs/heads/main";
+    // `--timings`: from the start to the first cell asked for (the tree, the cache token, the base), the
+    // cells, and from the last job's end to the exit (the VMs nobody used, ended).
+    const marks = { cells: 0, jobsDone: 0 };
+    let cellTimings: readonly CellTiming[] = [];
+    const writeTimings = Effect.sync(() => {
+      if (!timings) return;
+      const end = Date.now();
+      const report = {
+        totalMs: end - t0,
+        startMs: marks.cells ? marks.cells - t0 : null,
+        closeMs: marks.jobsDone ? end - marks.jobsDone : null,
+        cells: cellTimings,
+      };
+      // A measurement: a file that cannot be written loses it, never the run's verdict.
+      try {
+        writeFileSync(timings, `${JSON.stringify(report)}\n`);
+      } catch {
+        // Said nowhere on purpose: the caller reads the file and records nothing when it is missing.
+      }
+    });
     return yield* Effect.gen(function* () {
-      const repo = yield* Repo;
-      const patches = new Map<string, string>();
-      const patchOf = (sha: string) =>
-        patches.has(sha) ? Effect.succeed(patches.get(sha)!) : repo.patchFrom(sha).pipe(Effect.tap((patch) => Effect.sync(() => patches.set(sha, patch))));
-      const base = yield* repo.base;
-      const baseCommit = base ? spawnSync("git", ["cat-file", "commit", base.sha], { encoding: "utf8" }) : undefined;
-      yield* Console.log(`outrun run: ${found.shown}: ${jobs.length} job(s) on ${repository}, the tree ${ref ? `of ${ref}` : "of HEAD with its changes"}`);
-      // The cells each job ran last time here: as many VMs start ahead while its needs run.
-      const dir = stateDir(process.env);
-      const key = (job: string) => `${repository} ${found.shown} ${job}`;
-      // A cache: unreadable, nothing starts ahead.
-      const known = yield* loadCells(dir).pipe(Effect.catchTag("FileFailed", () => Effect.succeed<Cells>({})));
-      const cells = Object.fromEntries(jobs.flatMap((j) => (known[key(j.id)] ? [[j.id, known[key(j.id)]!]] : [])));
-      const cellsOf = yield* fleet(repository, patchOf, repo.messageFrom, base, baseCommit?.status === 0 ? baseCommit.stdout : undefined, cells);
-      const results = yield* runWorkflow(
-        workflow,
-        jobs,
-        { repository, ref: branch, inputs, env: cacheEnv },
-        cellsOf.runCell,
-        (line) => Console.log(line),
-        cellsOf.ahead,
-      ).pipe(
-        Effect.ensuring(
-          cellsOf.close.pipe(
-            Effect.flatMap((learned) =>
-              Object.keys(learned).length === 0
-                ? Effect.void
-                : // A cache: not writable, the next run starts nothing ahead.
-                  saveCells(dir, { ...known, ...Object.fromEntries(Object.entries(learned).map(([j, n]) => [key(j), n])) }).pipe(
-                    Effect.catchTag("FileFailed", () => Effect.void),
-                  ),
+      const found = locate(name);
+      if (!found) return yield* new RunRefused({ message: `${name}: no such workflow file (a path, or a name in .github/workflows)` });
+      // The repository's name first: a refusal names its own repository's checkout as allowed.
+      const origin = spawnSync("git", ["remote", "get-url", "origin"], { encoding: "utf8" }).stdout.trim();
+      const repository = repositoryOf(origin) ?? "";
+      const { workflow, jobs, inputs } = yield* prepare(found.shown, readFileSync(found.file, "utf8"), job, field, repository);
+      if (!repository) return yield* new NotRun({ message: `origin is not a GitHub repository: ${shownOrigin(origin)}` });
+      const token = process.env.OUTRUN_API_TOKEN;
+      if (!token) return yield* new NotRun({ message: "OUTRUN_API_TOKEN is not set (an installation's API token)" });
+      const id = installation || process.env.OUTRUN_INSTALLATION || "";
+      if (!/^\d+$/.test(id))
+        return yield* new NotRun({ message: "no installation: set OUTRUN_INSTALLATION or pass --installation (its GitHub App installation id)" });
+      const api = process.env.OUTRUN_API ?? "https://api.outrun.sh";
+      const githubToken = process.env.OUTRUN_GITHUB_TOKEN || undefined;
+      if (!githubToken) yield* Console.error("outrun run: OUTRUN_GITHUB_TOKEN is not set: the warm checkouts stay at the commit the Minis' mirrors have");
+      // The run's cache token while the tree is read: no time on the run's path.
+      const [cacheEnv, tree] = yield* Effect.all([cacheEnvOf(api, id, token, repository), treeOf(ref || undefined)], { concurrency: 2 });
+      const branch = spawnSync("git", ["symbolic-ref", "-q", "HEAD"], { encoding: "utf8" }).stdout.trim() || "refs/heads/main";
+      return yield* Effect.gen(function* () {
+        const repo = yield* Repo;
+        const patches = new Map<string, string>();
+        const patchOf = (sha: string) =>
+          patches.has(sha) ? Effect.succeed(patches.get(sha)!) : repo.patchFrom(sha).pipe(Effect.tap((patch) => Effect.sync(() => patches.set(sha, patch))));
+        const base = yield* repo.base;
+        const baseCommit = base ? spawnSync("git", ["cat-file", "commit", base.sha], { encoding: "utf8" }) : undefined;
+        yield* Console.log(`outrun run: ${found.shown}: ${jobs.length} job(s) on ${repository}, the tree ${ref ? `of ${ref}` : "of HEAD with its changes"}`);
+        // The cells each job ran last time here: as many VMs start ahead while its needs run.
+        const dir = stateDir(process.env);
+        const key = (job: string) => `${repository} ${found.shown} ${job}`;
+        // A cache: unreadable, nothing starts ahead.
+        const known = yield* loadCells(dir).pipe(Effect.catchTag("FileFailed", () => Effect.succeed<Cells>({})));
+        const cells = Object.fromEntries(jobs.flatMap((j) => (known[key(j.id)] ? [[j.id, known[key(j.id)]!]] : [])));
+        const cellsOf = yield* fleet(repository, patchOf, repo.messageFrom, base, baseCommit?.status === 0 ? baseCommit.stdout : undefined, cells);
+        cellTimings = cellsOf.timings;
+        marks.cells = Date.now();
+        const results = yield* runWorkflow(
+          workflow,
+          jobs,
+          { repository, ref: branch, inputs, env: cacheEnv },
+          cellsOf.runCell,
+          (line) => Console.log(line),
+          cellsOf.ahead,
+        ).pipe(
+          Effect.ensuring(Effect.sync(() => void (marks.jobsDone = Date.now()))),
+          Effect.ensuring(
+            cellsOf.close.pipe(
+              Effect.flatMap((learned) =>
+                // Nothing new learned (a run's usual case: the same cells as last time), nothing written: on a loaded
+                // laptop this write stalled 8.5 to 12.5 s, 2 runs of 8, on the presubmit's path (issue #559).
+                Object.entries(learned).every(([j, n]) => known[key(j)] === n)
+                  ? Effect.void
+                  : // A cache: not writable, the next run starts nothing ahead.
+                    saveCells(dir, { ...known, ...Object.fromEntries(Object.entries(learned).map(([j, n]) => [key(j), n])) }).pipe(
+                      Effect.catchTag("FileFailed", () => Effect.void),
+                    ),
+              ),
             ),
           ),
-        ),
-      );
-      const failed = [...results].filter(([, r]) => r === "failure").map(([j]) => j);
-      if (failed.length > 0) {
-        yield* Console.error(`outrun run: ${found.shown}: FAILED (${failed.join(", ")}) · ${s(Date.now() - t0)}`);
-        return yield* new RunFailed();
-      }
-      yield* Console.log(`outrun run: ${found.shown}: passed · ${s(Date.now() - t0)}`);
-    }).pipe(Effect.provide(Layer.merge(checkApiLive(api, id, token, githubToken), repoLive(tree))));
+        );
+        const failed = [...results].filter(([, r]) => r === "failure").map(([j]) => j);
+        if (failed.length > 0) {
+          yield* Console.error(`outrun run: ${found.shown}: FAILED (${failed.join(", ")}) · ${s(Date.now() - t0)}`);
+          return yield* new RunFailed();
+        }
+        yield* Console.log(`outrun run: ${found.shown}: passed · ${s(Date.now() - t0)}`);
+        // The whole workflow passed on this tree: recorded, so that a sandbox may land it (recordPassed).
+        if (job.length === 0) yield* recordPassed(api, id, token, repository, found.shown, tree);
+      }).pipe(Effect.provide(Layer.merge(checkApiLive(api, id, token, githubToken), repoLive(tree))));
+    }).pipe(Effect.ensuring(writeTimings));
   });
 
 export const runCommand = Command.make("run", flags, handler).pipe(

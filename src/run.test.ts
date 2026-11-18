@@ -77,6 +77,14 @@ describe("expressions as GitHub evaluates them", () => {
     expect(evaluate(parse("join(fromJSON(needs.plan.outputs.list), '+')"), scope)).toBe("a+b");
     expect(interpolate(`go \${{ matrix.os }} \${{ matrix.n }}`, scope)).toBe("go linux 2");
   });
+  it("reads a property through an object filter on each item, as needs.*.result", () => {
+    const needs = { contexts: { needs: { a: { result: "success", outputs: { n: "1" } }, b: { result: "failure" }, c: {} } } };
+    expect(evaluate(parse("needs.*.result"), needs)).toEqual(["success", "failure"]);
+    expect(evaluate(condition("always() && contains(needs.*.result, 'failure')"), needs)).toBe(true);
+    expect(evaluate(parse("contains(needs.*.result, 'cancelled')"), needs)).toBe(false);
+    expect(evaluate(parse("needs.*.outputs.*"), needs)).toEqual(["1"]);
+    expect(evaluate(parse("needs.a.result"), needs)).toBe("success");
+  });
   it("adds success() to an if: without a status function", () => {
     const node = condition("inputs.mode == 'fast'");
     expect(evaluate(node, { ...scope, status: "failure" })).toBe(false);

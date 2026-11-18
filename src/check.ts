@@ -32,6 +32,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import { expectedDurations, shard } from "./balance.ts";
+import { repositoryOf, shownOrigin } from "./git.ts";
 
 // The check protocol this client speaks (the control plane refuses another): 2, the units of the
 // repository's own declaration.
@@ -343,8 +344,8 @@ export const repoLive = (head = "HEAD") =>
   Layer.succeed(Repo, {
     name: exec("git", ["remote", "get-url", "origin"]).pipe(
       Effect.flatMap((url) => {
-        const match = /github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\s*$/.exec(url);
-        return match ? Effect.succeed(match[1]!) : Effect.fail(new NotRun({ message: `origin is not a GitHub repository: ${url.trim()}` }));
+        const name = repositoryOf(url);
+        return name ? Effect.succeed(name) : Effect.fail(new NotRun({ message: `origin is not a GitHub repository: ${shownOrigin(url)}` }));
       }),
     ),
     // The warm commit fetched if this clone lacks it; then the whole tree against it.
