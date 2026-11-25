@@ -6,7 +6,9 @@ import * as Layer from "effect/Layer";
 import {
   changeMessage,
   CheckApi,
+  checkApiLive,
   type CheckEvent,
+  githubTokenWarning,
   MESSAGE_MAX_CHARS,
   NotRun,
   overTarget,
@@ -341,5 +343,45 @@ describe("the patch a check sends", () => {
     expect(patchBody("aaaa", { aaaa: "on a" }, "m")).toEqual({ patch: "on a", message: "m" });
     expect(patchBody("aaaa", { bbbb: "on b" }, "m", "c")).toEqual({ patch: "", patches: { bbbb: "on b" }, message: "m", change: "c" });
     expect(patchBody("aaaa", { aaaa: "on a", bbbb: "on b" }, "m").patches).toEqual({ aaaa: "on a", bbbb: "on b" });
+  });
+});
+
+// 2026-11-19 (Gabin): never a person's GitHub identity to the control plane. A presubmit sent the developer's
+// own token with every check (OUTRUN_GITHUB_TOKEN, filled by `git credential fill`).
+describe("no caller's GitHub token", () => {
+  it.effect("a check is created with no X-GitHub-Token, whatever OUTRUN_GITHUB_TOKEN holds", () =>
+    Effect.gen(function* () {
+      const sent: Record<string, string>[] = [];
+      const real = globalThis.fetch;
+      const saved = process.env.OUTRUN_GITHUB_TOKEN;
+      process.env.OUTRUN_GITHUB_TOKEN = "ghp_personal_token_of_a_developer";
+      globalThis.fetch = (async (_url: string, init: RequestInit) => {
+        sent.push(init.headers as Record<string, string>);
+        return Response.json({ check: { id: "abc", workers: [] } }, { status: 201 });
+      }) as typeof fetch;
+      yield* Effect.gen(function* () {
+        const api = yield* CheckApi;
+        yield* api.create("acme/app", 1);
+      }).pipe(
+        Effect.provide(checkApiLive("https://api.example.com", "42", "ort_x")),
+        Effect.ensuring(
+          Effect.sync(() => {
+            globalThis.fetch = real;
+            if (saved === undefined) delete process.env.OUTRUN_GITHUB_TOKEN;
+            else process.env.OUTRUN_GITHUB_TOKEN = saved;
+          }),
+        ),
+      );
+      expect(sent).toHaveLength(1);
+      expect(Object.keys(sent[0]!).map((key) => key.toLowerCase())).not.toContain("x-github-token");
+      expect(JSON.stringify(sent)).not.toContain("ghp_personal");
+    }),
+  );
+
+  it("OUTRUN_GITHUB_TOKEN still set is said to be ignored; unset, nothing is said", () => {
+    expect(githubTokenWarning("outrun run", { OUTRUN_GITHUB_TOKEN: "ghp_x" })).toBe(
+      "outrun run: OUTRUN_GITHUB_TOKEN is ignored: outrun reads the repository with its own GitHub App; unset it",
+    );
+    expect(githubTokenWarning("outrun check", {})).toBeUndefined();
   });
 });

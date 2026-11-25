@@ -135,10 +135,17 @@ jobs:
     const { results, log } = await run(yaml);
     expect(results).toEqual({ a: "success" });
     // The load only when the sampler gave one (a busy runner may not within the step): its time always.
-    expect(log).toMatch(/── step 1\/1 · Busy: 2\.\d s( · CPU \d+% avg, \d+% peak of \d+ vCPU · memory \d+\.\d GB peak of \d+ GB)?\n/);
-    expect(log).toMatch(/ {2}Busy 2\.\d s( · CPU \d+% \(peak \d+%\) of \d+ · mem \d+\.\d\/\d+ GB)?\n/);
+    // The time has a floor and no ceiling: `sleep 2.5` takes at least 2.5 s, and as long as the machine's
+    // load makes it (8.4 s on a presubmit shard's VM at 90% CPU, 2026-11-18). So the test's timeout is a hang's,
+    // not vitest's 5 s default, which left that sleep 2.5 s of margin.
+    const stepLine = log.match(/── step 1\/1 · Busy: (\d+\.\d) s( · CPU \d+% avg, \d+% peak of \d+ vCPU · memory \d+\.\d GB peak of \d+ GB)?\n/);
+    const reportLine = log.match(/ {2}Busy (\d+\.\d) s( · CPU \d+% \(peak \d+%\) of \d+ · mem \d+\.\d\/\d+ GB)?\n/);
+    expect(stepLine, log).not.toBeNull();
+    expect(reportLine, log).not.toBeNull();
+    expect(Number(stepLine?.[1])).toBeGreaterThanOrEqual(2.5);
+    expect(Number(reportLine?.[1])).toBeGreaterThanOrEqual(2.5);
     expect(log).not.toMatch(/boat|hetzner|tart/i);
-  });
+  }, 30_000);
 });
 
 describe("a job's output ends with its last step", () => {
@@ -605,6 +612,7 @@ const fakeFleet = (slow?: string, { minis = ["mm1"], faults = {} }: { minis?: st
                       ? {}
                       : {
                           job: { outputs: name.endsWith(":plan") ? { shards: "[1,2]" } : {}, steps: [] },
+                          // An agent before 2026-11-19 sent its host's load: never printed.
                           host: { cpu: 634, cpuPeak: 981, memMb: 20582, memTotalMb: 32768, cpus: 12 },
                         },
                 });
@@ -740,8 +748,8 @@ describe("a cell whose worker failed for the fleet's reason runs again on anothe
   });
 });
 
-describe("the host's load during a job is in the run's report, beside its VM's", () => {
-  it("prints on the job's line the whole host's CPU (mean and peak of its cores) and its peak memory", async () => {
+describe("a job's line names no host's load (README \"A job and its host are never linked\")", () => {
+  it("prints where it ran and nothing of its host's load, even from an agent that sends it", async () => {
     const { layer } = fakeFleet();
     const lines: string[] = [];
     await Effect.runPromise(
@@ -762,7 +770,9 @@ describe("the host's load during a job is in the run's report, beside its VM's",
         yield* f.close;
       }).pipe(Effect.provide(layer)),
     );
-    expect(lines.join("\n")).toMatch(/✓ a · [\d.]+ s on mm1, main at a{8} · host CPU 63% \(peak 98%\) of 12 · mem 20\.1\/32 GB/);
+    expect(lines.join("\n")).toMatch(/✓ a · [\d.]+ s on mm1, main at a{8}$/m);
+    // Never its host's load, even from an agent that still sends it (README "A job and its host are never linked").
+    expect(lines.join("\n")).not.toContain("host CPU");
   });
 });
 

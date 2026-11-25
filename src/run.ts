@@ -18,7 +18,7 @@ import { spawnSync } from "node:child_process";
 // named and left out for the rest of the run (Gabin, 2026-11-11: one Mini misbehaving failed the
 // presubmit while the other shards passed); a job whose steps fail is a verdict, never run again.
 // Needs what `outrun check` needs: OUTRUN_API_TOKEN, OUTRUN_INSTALLATION (or --installation),
-// OUTRUN_API, OUTRUN_GITHUB_TOKEN.
+// OUTRUN_API (OUTRUN_GITHUB_TOKEN no more: check.ts `ignoredGithubToken`).
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
 import * as Argument from "effect/cli/Argument";
@@ -34,7 +34,7 @@ import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Scoped from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
-import { CheckApi, checkApiLive, NotRun, Repo, repoLive, treeOf, waitFor } from "./check.ts";
+import { CheckApi, checkApiLive, ignoredGithubToken, NotRun, Repo, repoLive, treeOf, waitFor } from "./check.ts";
 import { condition, evaluate, interpolate, type Scope, truthy, type Value } from "./expr.ts";
 import { repositoryOf, shownOrigin } from "./git.ts";
 import { basePrelude, compileJob, RUN_MAX_MINUTES } from "./job-script.ts";
@@ -133,10 +133,6 @@ interface Load {
   readonly memTotalMb: number;
   readonly cpus: number;
 }
-const isLoad = (value: unknown): value is Load =>
-  typeof value === "object" &&
-  value !== null &&
-  ["cpu", "cpuPeak", "memMb", "memTotalMb", "cpus"].every((k) => typeof (value as Record<string, unknown>)[k] === "number");
 // A step's load as the report shows it: "CPU 63% (peak 98%) of 10 · mem 9.1/16 GB".
 const loadText = (load: Load | undefined) =>
   load
@@ -149,8 +145,6 @@ export interface Ran {
   readonly log: string;
   readonly ms: number;
   readonly where: string;
-  // The whole host's load during the job (its agent's `host`, Mac agent 66): what its neighbours took.
-  readonly host?: Load;
 }
 export interface Cell {
   readonly job: string;
@@ -314,10 +308,7 @@ export const runWorkflow = <R>(
                   `${step.conclusion === "success" ? " " : step.conclusion === "skipped" ? "-" : "✗"} ${step.name} ${step.conclusion === "skipped" ? "skipped" : `${s(step.ms)}${loadText(step.load)}`}`,
               );
               yield* print(
-                [
-                  `${result.result === "success" ? "✓" : "✗"} ${name} · ${s(result.ms)} on ${result.where}${result.host ? ` · host${loadText(result.host).slice(2)}` : ""}`,
-                  ...steps.map((l) => `    ${l}`),
-                ].join("\n"),
+                [`${result.result === "success" ? "✓" : "✗"} ${name} · ${s(result.ms)} on ${result.where}`, ...steps.map((l) => `    ${l}`)].join("\n"),
               );
               if (result.log.trim()) yield* print(`--- ${name} ---\n${result.log.trimEnd()}\n---`);
               if (!ok) failed = true;
@@ -517,7 +508,6 @@ export const fleet = (
               log: shard.log,
               ms: back - t0,
               where: `${got.mini}${got.os === "macos" ? " (macOS)" : ""}, main at ${got.sha.slice(0, 8)}`,
-              ...(isLoad(shard.json.host) ? { host: shard.json.host } : {}),
             };
           };
           const outcome = shardOutcome(shard);
@@ -727,8 +717,7 @@ const handler = ({
       if (!/^\d+$/.test(id))
         return yield* new NotRun({ message: "no installation: set OUTRUN_INSTALLATION or pass --installation (its GitHub App installation id)" });
       const api = process.env.OUTRUN_API ?? "https://api.outrun.sh";
-      const githubToken = process.env.OUTRUN_GITHUB_TOKEN || undefined;
-      if (!githubToken) yield* Console.error("outrun run: OUTRUN_GITHUB_TOKEN is not set: the warm checkouts stay at the commit the Minis' mirrors have");
+      yield* ignoredGithubToken("outrun run");
       // The run's cache token while the tree is read: no time on the run's path.
       const [cacheEnv, tree] = yield* Effect.all([cacheEnvOf(api, id, token, repository), treeOf(ref || undefined)], { concurrency: 2 });
       const branch = spawnSync("git", ["symbolic-ref", "-q", "HEAD"], { encoding: "utf8" }).stdout.trim() || "refs/heads/main";
@@ -781,7 +770,7 @@ const handler = ({
         yield* Console.log(`outrun run: ${found.shown}: passed · ${s(Date.now() - t0)}`);
         // The whole workflow passed on this tree: recorded, so that a sandbox may land it (recordPassed).
         if (job.length === 0) yield* recordPassed(api, id, token, repository, found.shown, tree);
-      }).pipe(Effect.provide(Layer.merge(checkApiLive(api, id, token, githubToken), repoLive(tree))));
+      }).pipe(Effect.provide(Layer.merge(checkApiLive(api, id, token), repoLive(tree))));
     }).pipe(Effect.ensuring(writeTimings));
   });
 

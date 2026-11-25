@@ -1,6 +1,6 @@
 // `outrun check`: the repository's fast CI on the tree of HEAD, run on outrun's Linux VMs instead of
-// this machine, as the repository declares it in its `.outrun/check.json` (README.md "outrun
-// check: the fast CI on outrun's VMs").
+// this machine, as the repository declares it in its `.outrun/check.json` (outrun/alpha/README.md
+// "outrun check: the fast CI on outrun's VMs").
 // One check: its workers placed at the priority tier on VMs restored from a warm checkout (a commit
 // of main), HEAD's tree sent as a patch on that commit, the first worker's plan (the units to run,
 // each with its expected time) split over the workers by longest processing time first (outrun's
@@ -15,10 +15,9 @@
 // units' last runs) and CHECK_SLACK_MS once the shards are sent, READY_MS before; a check waiting
 // longer is ended and not run, so a presubmit never waits on the fleet past what it would take.
 // Needs OUTRUN_API_TOKEN, an installation's API token (`ort_…`), and its installation id
-// (OUTRUN_INSTALLATION or --installation); OUTRUN_API, the control plane (https://api.outrun.sh). OUTRUN_GITHUB_TOKEN, a GitHub token that may read the
-// repository, is sent with the check (header X-GitHub-Token) so the Minis fetch their mirror of a
-// private repository before building its warm checkout (used for that fetch only, never stored);
-// without it the warms stay at the commit their mirror has.
+// (OUTRUN_INSTALLATION or --installation); OUTRUN_API, the control plane (https://api.outrun.sh). No GitHub
+// token: the control plane reads the repository with its own (its GitHub App's `contents: read`), so
+// OUTRUN_GITHUB_TOKEN, sent until 2026-11-19, is ignored with a warning (`ignoredGithubToken`).
 import { spawn } from "node:child_process";
 import { rmSync } from "node:fs";
 import { copyFile } from "node:fs/promises";
@@ -411,7 +410,17 @@ export const patchBody = (sha: string, patches: Readonly<Record<string, string>>
   ...(change === undefined ? {} : { change }),
 });
 
-export const checkApiLive = (api: string, installation: string, token: string, githubToken: string | undefined) => {
+// OUTRUN_GITHUB_TOKEN, once sent with each check: never a person's GitHub identity to the control plane
+// (2026-11-19). Still set, it is said once and sent nowhere.
+export const githubTokenWarning = (command: "outrun run" | "outrun check", env: Readonly<Record<string, string | undefined>>) =>
+  env.OUTRUN_GITHUB_TOKEN ? `${command}: OUTRUN_GITHUB_TOKEN is ignored: outrun reads the repository with its own GitHub App; unset it` : undefined;
+
+export const ignoredGithubToken = (command: "outrun run" | "outrun check") => {
+  const warning = githubTokenWarning(command, process.env);
+  return warning ? Console.error(warning) : Effect.void;
+};
+
+export const checkApiLive = (api: string, installation: string, token: string) => {
   const base = `${api}/v1/installations/${installation}/checks`;
   const request = (path: string, init: { method: string; body?: unknown; headers?: Record<string, string> }, timeoutMs = 30_000) =>
     Effect.tryPromise({
@@ -451,7 +460,6 @@ export const checkApiLive = (api: string, installation: string, token: string, g
           ...(os ? { os } : {}),
           ...(exclude && exclude.length > 0 ? { exclude } : {}),
         },
-        ...(githubToken ? { headers: { "x-github-token": githubToken } } : {}),
       }).pipe(Effect.map((body) => body as unknown as Created)),
     patch: (id, sha, patches, message, change) =>
       request(`/${id}/patch`, { method: "POST", body: patchBody(sha, patches, message, change) }).pipe(Effect.asVoid),
@@ -484,9 +492,8 @@ const handler = ({ workers, target, installation }: { readonly workers: number; 
       return yield* new NotRun({ message: "no installation: set OUTRUN_INSTALLATION or pass --installation (its GitHub App installation id)" });
     if (workers < 1 || workers > 8) return yield* new NotRun({ message: "--workers is 1 to 8" });
     const api = process.env.OUTRUN_API ?? "https://api.outrun.sh";
-    const githubToken = process.env.OUTRUN_GITHUB_TOKEN || undefined;
-    if (!githubToken) yield* Console.error("outrun check: OUTRUN_GITHUB_TOKEN is not set: the warm checkouts stay at the commit the Minis' mirrors have");
-    return yield* runRepoCheck(workers, target * 1000).pipe(Effect.provide(Layer.merge(checkApiLive(api, id, token, githubToken), repoLive())));
+    yield* ignoredGithubToken("outrun check");
+    return yield* runRepoCheck(workers, target * 1000).pipe(Effect.provide(Layer.merge(checkApiLive(api, id, token), repoLive())));
   });
 
 export const checkCommand = Command.make("check", flags, handler).pipe(

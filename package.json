@@ -1,8 +1,8 @@
 {
   "name": "@arkadia-so/outrun",
-  "version": "1.12.0",
+  "version": "1.12.1",
   "private": true,
-  "description": "outrun's CI engine: each test file a unit, keyed by its content, its verdict cached, the misses batched and balanced across runners.",
+  "description": "outrun's CLI and GitHub Action, for GitHub Actions jobs on outrun's runners (outrun.sh): `outrun report` says where a run's time goes.",
   "homepage": "https://outrun.sh",
   "bugs": {
     "email": "contact@arkadia.so"

@@ -1,5 +1,5 @@
 // End to end: a git repository with a bun workspace, run, re-run, changed, failed.
-import { chmod, rm, writeFile } from "node:fs/promises";
+import { chmod, readFile, rm, writeFile } from "node:fs/promises";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Exit } from "effect";
 import { blocking, contextDiff, deadlineMs, lookupCommand, plan, recordCommand, test as outrunTest, type TestOptions } from "./engine.ts";
@@ -241,7 +241,13 @@ describe("outrun test", () => {
         // What a build leaves in the checkout, unignored: keying would read it, and fails on this one.
         yield* io(() => writeFile(`${dir}/src/output.bin`, "built\n"));
         yield* io(() => chmod(`${dir}/src/output.bin`, 0o000));
-        expect(Exit.isFailure(yield* Effect.exit(recordCommand({ ...options(dir, state, "k1"), name: "build", write: false, durationMs: 1000 })))).toBe(true);
+        // That keying would read it is shown only where mode 000 refuses the read, so the test asks this process:
+        // root reads it anyway, and so does a user with CAP_DAC_READ_SEARCH (a sandbox's uid 1000, 2026-11-19).
+        // No other file fails Bun's read for them (it takes a directory, FIFO or dangling link for absent, and
+        // reads a /proc file as empty). The record by key below holds on any host.
+        const refused = yield* Effect.exit(io(() => readFile(`${dir}/src/output.bin`)));
+        if (Exit.isFailure(refused))
+          expect(Exit.isFailure(yield* Effect.exit(recordCommand({ ...options(dir, state, "k1"), name: "build", write: false, durationMs: 1000 })))).toBe(true);
         yield* recordCommand({ ...options(dir, state, "k1"), name: "build", write: false, durationMs: 1000, key: before.commandKeys.build });
         yield* io(() => rm(`${dir}/src/output.bin`));
         expect((yield* plan({ ...options(dir, state, "k2"), out, runners })).commands).toEqual({ build: "hit" });

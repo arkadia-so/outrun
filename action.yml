@@ -1,5 +1,5 @@
 name: outrun
-description: Puts outrun's CLI on the job's PATH, at the version this action is pinned to; the job then runs `outrun lookup`, `outrun record` or `outrun test` itself.
+description: Puts outrun's CLI on the job's PATH, at the version this action is pinned to; the job then runs `outrun report` itself.
 author: Arkadia
 runs:
   using: composite
